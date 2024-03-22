@@ -1,0 +1,4 @@
+
+[workspace]
+members = [ "client", "core-lib","server" ]
+resolver = "2"
