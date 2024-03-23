@@ -6,3 +6,16 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+core-lib = { path = "../core-lib" }
+async-std = "1.12.0"
+futures = "0.3.30"
+futures-util = "0.3.30"
+async-tungstenite = { version = "0.25.0", features = ["async-std-runtime"] }
+semver = "1.0.22"
+clap = { version = "4.5.3", features = ["derive"] }
+
+[dependencies.uuid]
+version = "1.8.0"
+features = [
+    "v4"                # Lets you generate random UUIDs
+]
