@@ -48,10 +48,10 @@ jobs:
 
   update_release:
     needs: [build_release]
-    strategy:
-      matrix:
-        # macos-13 is x86 , macos-14 is M1
-        os: [windows-2022, ubuntu-22.04, macos-13, macos-14]
+    # strategy:
+    #   matrix:
+    #     # macos-13 is x86 , macos-14 is M1
+    #     os: [windows-2022, ubuntu-22.04, macos-13, macos-14]
     runs-on: ubuntu-latest
     
     
@@ -68,17 +68,17 @@ jobs:
       
     - name: rename
       run: |
-        move ./artifacts/release-macos-13/client ./artifacts/macos-x86-client 
-        move ./artifacts/release-macos-13/server ./artifacts/macos-x86-server 
+        mv ./artifacts/release-macos-13/client ./artifacts/macos-x86-client 
+        mv ./artifacts/release-macos-13/server ./artifacts/macos-x86-server 
         
-        move ./artifacts/release-macos-14/client ./artifacts/macos-arm-client 
-        move ./artifacts/release-macos-14/server ./artifacts/macos-arm-server 
+        mv ./artifacts/release-macos-14/client ./artifacts/macos-arm-client 
+        mv ./artifacts/release-macos-14/server ./artifacts/macos-arm-server 
         
-        move ./artifacts/release-ubuntu-22.04/client ./artifacts/ubuntu-client 
-        move ./artifacts/release-ubuntu-22.04/server ./artifacts/ubuntu-server 
+        mv ./artifacts/release-ubuntu-22.04/client ./artifacts/ubuntu-client 
+        mv ./artifacts/release-ubuntu-22.04/server ./artifacts/ubuntu-server 
         
-        move ./artifacts/release-windows-2022/client.exe ./artifacts/windows-client.exe 
-        move ./artifacts/release-windows-2022/server.exe ./artifacts/windows-server.exe 
+        mv ./artifacts/release-windows-2022/client.exe ./artifacts/windows-client.exe 
+        mv ./artifacts/release-windows-2022/server.exe ./artifacts/windows-server.exe 
 
         
     - name: upload release
