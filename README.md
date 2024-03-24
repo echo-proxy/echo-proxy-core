@@ -9,7 +9,7 @@ Echo Proxy is a secure and transparent proxy based on websocket
 #### Example
 
 ```bash
-echo-proxy-client --endpoint wss://example.org/proxy --user user1
+echo-proxy-client --endpoint wss://example.org/proxy/ --user user1
 ```
 
 #### More help information
