@@ -10,8 +10,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-permissions:
-  contents: write
+# permissions:
+#   contents: write
   
 jobs:
   build_release:
@@ -53,7 +53,9 @@ jobs:
     #     # macos-13 is x86 , macos-14 is M1
     #     os: [windows-2022, ubuntu-22.04, macos-13, macos-14]
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: write
+      pull-requests: write
     
     steps:
     # - name: download asset
@@ -80,7 +82,10 @@ jobs:
         mv ./artifacts/release-windows-2022/client.exe ./artifacts/windows-client.exe 
         mv ./artifacts/release-windows-2022/server.exe ./artifacts/windows-server.exe 
 
-        
+    - uses: release-drafter/release-drafter@v5
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
     - name: upload release
       uses: softprops/action-gh-release@v2
       with:
