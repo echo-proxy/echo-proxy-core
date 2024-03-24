@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+  
+jobs:
+  build_release:
+    strategy:
+      matrix:
+        # macos-13 is x86 , macos-14 is M1
+        os: [windows-2022, ubuntu-22.04, macos-13, macos-14]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: cargo build --release --verbose
+      
+    - name: move windows
+      if: ${{ matrix.os == 'windows-2022' }}
+      run: |
+        mkdir ./target/bin
+        mv ./target/release/client.exe ./target/bin/client.exe
+        mv ./target/release/server.exe ./target/bin/server.exe
+    - name: move other
+      if: ${{ matrix.os != 'windows-2022' }}
+      run: |
+        mkdir ./target/bin
+        mv ./target/release/client ./target/bin/client
+        mv ./target/release/server ./target/bin/server
+        
+    - name: upload asset
+      uses: actions/upload-artifact@v4.3.1
+      with:
+        name: release-${{ matrix.os }}
+        path: ./target/bin/
+        
+
+  update_release:
+    needs: [build_release]
+    strategy:
+      matrix:
+        # macos-13 is x86 , macos-14 is M1
+        os: [windows-2022, ubuntu-22.04, macos-13, macos-14]
+    runs-on: ubuntu-latest
+    
+    
+    steps:
+    # - name: download asset
+    #   uses: actions/download-artifact@v2
+    #   with:
+    #     name: release-${{ matrix.os }}
+    - uses: actions/download-artifact@v4
+      with:
+        path: ./artifacts
+    - name: Display structure of downloaded files
+      run: ls -R ./artifacts
+      
+    - name: rename
+      run: |
+        move ./artifacts/release-macos-13/client ./artifacts/macos-x86-client 
+        move ./artifacts/release-macos-13/server ./artifacts/macos-x86-server 
+        
+        move ./artifacts/release-macos-14/client ./artifacts/macos-arm-client 
+        move ./artifacts/release-macos-14/server ./artifacts/macos-arm-server 
+        
+        move ./artifacts/release-ubuntu-22.04/client ./artifacts/ubuntu-client 
+        move ./artifacts/release-ubuntu-22.04/server ./artifacts/ubuntu-server 
+        
+        move ./artifacts/release-windows-2022/client.exe ./artifacts/windows-client.exe 
+        move ./artifacts/release-windows-2022/server.exe ./artifacts/windows-server.exe 
+
+        
+    - name: upload release
+      uses: softprops/action-gh-release@v2
+      with:
+          files: |
+            ./artifacts/*
+            
+    
