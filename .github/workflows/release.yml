@@ -70,8 +70,8 @@ jobs:
       
     - name: rename
       run: |
-        mv ./artifacts/release-macos-13/client ./artifacts/macos-x86-client 
-        mv ./artifacts/release-macos-13/server ./artifacts/macos-x86-server 
+        mv ./artifacts/release-macos-13/client ./artifacts/macos-x64-client 
+        mv ./artifacts/release-macos-13/server ./artifacts/macos-x64-server 
         
         mv ./artifacts/release-macos-14/client ./artifacts/macos-arm-client 
         mv ./artifacts/release-macos-14/server ./artifacts/macos-arm-server 
