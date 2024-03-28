@@ -352,7 +352,6 @@ version = "0.1.0"
 dependencies = [
  "async-std",
  "async-tungstenite",
- "base64",
  "clap",
  "core-lib",
  "futures",
@@ -393,7 +392,9 @@ checksum = "06ea2b9bc92be3c2baa9334a323ebca2d6f074ff852cd1d7b11064035cd3868f"
 name = "core-lib"
 version = "0.1.0"
 dependencies = [
+ "async-std",
  "base64",
+ "futures",
  "rand 0.8.5",
  "rng",
 ]
@@ -1144,6 +1145,7 @@ dependencies = [
  "core-lib",
  "futures",
  "futures-util",
+ "httparse",
  "semver",
  "uuid",
 ]
