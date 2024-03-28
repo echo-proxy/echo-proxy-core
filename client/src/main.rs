@@ -96,6 +96,11 @@ async fn run(remote_server: &str, addr: String) {
     println!("http proxy listening on {}", addr);
 
     while let Some(stream) = incoming.next().await {
+        let stream = stream;
+        if stream.is_err() {
+            println!("failed to accept connection: {:?}", stream.err().unwrap());
+            continue;
+        }
         let stream = stream.unwrap();
 
         let remote_server = remote_server.to_string();
