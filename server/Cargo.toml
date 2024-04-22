@@ -13,6 +13,7 @@ futures-util = "0.3.30"
 async-tungstenite = { version = "0.25.0", features = ["async-std-runtime"] }
 semver = "1.0.22"
 clap = { version = "4.5.3", features = ["derive"] }
+httparse = "1.8.0"
 
 [dependencies.uuid]
 version = "1.8.0"
