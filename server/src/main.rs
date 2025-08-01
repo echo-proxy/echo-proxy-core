@@ -14,7 +14,7 @@ use async_tungstenite::{
 };
 use clap::Parser;
 use futures::AsyncReadExt;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{StreamExt};
 use semver::{Version, VersionReq};
 use uuid::Uuid;
 
@@ -113,7 +113,7 @@ async fn process_control(mut ws_stream: WebSocketStream<TcpStream>, user_list: V
                 let msg = format!("The installed version is not supported, please download the latest version from {}", download_url);
 
                 ws_stream
-                    .send(Message::Text(format!("{}{}", disallow_str, msg)))
+                    .send(Message::Text(format!("{}{}", disallow_str, msg).into()))
                     .await
                     .unwrap();
                 ws_stream.close(None).await.unwrap();
@@ -126,7 +126,7 @@ async fn process_control(mut ws_stream: WebSocketStream<TcpStream>, user_list: V
                     .send(Message::Text(format!(
                         "{}{}",
                         disallow_str, "User not allowed"
-                    )))
+                    ).into()))
                     .await
                     .unwrap();
                 ws_stream.close(None).await.unwrap();
@@ -135,7 +135,7 @@ async fn process_control(mut ws_stream: WebSocketStream<TcpStream>, user_list: V
             let token = Uuid::new_v4();
 
             ws_stream
-                .send(Message::Text(format!("{}{}", allow_str, token)))
+                .send(Message::Text(format!("{}{}", allow_str, token).into()))
                 .await
                 .unwrap();
         }
@@ -149,7 +149,7 @@ async fn exchange_data(ws_stream: WebSocketStream<TcpStream>, dist: String) {
     let tcp_stream = TcpStream::connect(dist).await.unwrap();
 
     let (mut tcp_reader, mut tcp_writer) = tcp_stream.split();
-    let (mut ws_writer, mut ws_reader) = ws_stream.split();
+    let (ws_writer, mut ws_reader) = ws_stream.split();
 
     std::thread::spawn(move || {
         task::block_on(async {
@@ -177,7 +177,7 @@ async fn exchange_data(ws_stream: WebSocketStream<TcpStream>, dist: String) {
                 let data = &buf[0..n];
                 // debug!("t -> s {:?}", data);
                 let data = data.to_vec();
-                let res = ws_writer.send(Message::Binary(data)).await;
+                let res = ws_writer.send(Message::Binary(data.into())).await;
                 if res.is_err() {
                     break;
                 }

@@ -74,7 +74,7 @@ async fn check_server(remote_server: &str, user_id: &str) -> bool {
         .await
         .expect("Failed to connect");
     ws_stream
-        .send(Message::Text(format!("Hello:{}:{}", app_version, user_id)))
+        .send(Message::Text(format!("Hello:{}:{}", app_version, user_id).into()))
         .await
         .unwrap();
     ws_stream.flush().await.unwrap();
@@ -161,7 +161,7 @@ async fn handle_https(ws_url: String, mut tcp_stream: TcpStream) {
 
     let (mut tcp_reader, mut tcp_writer) = tcp_stream.split();
 
-    let (mut ws_writer, mut ws_reader) = ws_stream.split();
+    let (ws_writer, mut ws_reader) = ws_stream.split();
 
     std::thread::spawn(move || {
         task::block_on(async {
@@ -196,7 +196,7 @@ async fn handle_https(ws_url: String, mut tcp_stream: TcpStream) {
                 }
                 let data = &buf[0..n];
                 let data = data.to_vec();
-                let res = ws_writer.send(Message::Binary(data)).await;
+                let res = ws_writer.send(Message::Binary(data.into())).await;
                 if res.is_err() {
                     break;
                 }
@@ -211,11 +211,11 @@ async fn handle_http(ws_url: String, mut tcp_stream: TcpStream, headers: String,
     let (mut ws_stream, _) = connect_async(ws_request).await.expect("Failed to connect");
 
     ws_stream
-        .send(Message::Binary(headers.as_bytes().to_vec()))
+        .send(Message::Binary(headers.as_bytes().to_vec().into()))
         .await
         .unwrap();
     if body.len() > 0 {
-        ws_stream.send(Message::Binary(body)).await.unwrap();
+        ws_stream.send(Message::Binary(body.into())).await.unwrap();
     }
     ws_stream.flush().await.unwrap();
 
