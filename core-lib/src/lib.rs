@@ -3,10 +3,10 @@ use rand::Rng;
 
 fn generate_random_character() -> char {
     let res = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let ascii_start = 0; // start of printable ascii characters
     let ascii_end = res.len() - 1; // end of printable ascii characters
-    let idx = rng.gen_range(ascii_start..=ascii_end);
+    let idx = rng.random_range(ascii_start..=ascii_end);
     res.chars().nth(idx).unwrap()
 }
 
