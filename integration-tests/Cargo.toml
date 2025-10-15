@@ -1,0 +1,11 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+core-lib = { path = "../core-lib" }
+client = { path = "../client" }
+server = { path = "../server" }
+semver = "1.0"
+tokio = { version = "1.0", features = ["full"] }
