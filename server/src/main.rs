@@ -13,8 +13,7 @@ use async_tungstenite::{
     WebSocketStream,
 };
 use clap::Parser;
-use futures::AsyncReadExt;
-use futures_util::{StreamExt};
+use futures::{AsyncReadExt, StreamExt};
 use semver::{Version, VersionReq};
 use uuid::Uuid;
 
