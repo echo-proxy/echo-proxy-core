@@ -4,5 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-std.workspace = true
 base64.workspace = true
 rand.workspace = true

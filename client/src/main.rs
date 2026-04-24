@@ -1,24 +1,34 @@
-use async_std::net::TcpListener;
-use async_std::net::TcpStream;
-use async_std::task;
-use async_tungstenite::tungstenite::http::Request;
-use async_tungstenite::tungstenite::http::Uri;
-use async_tungstenite::{async_std::connect_async, tungstenite::Message};
+use async_std::{
+    channel,
+    io::BufReader,
+    net::{TcpListener, TcpStream},
+    task,
+};
+use async_tungstenite::{
+    async_std::connect_async,
+    tungstenite::{
+        handshake::client::generate_key,
+        http::{Request, Uri},
+        Message,
+    },
+};
 use clap::Parser;
-use core_lib::protocol;
-use futures::{prelude::*, AsyncReadExt, StreamExt};
-use futures_util::SinkExt;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use core_lib::{frame_channel, Frame, FrameTx, StreamRegistry};
+use futures::{io::AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, SinkExt, StreamExt};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
+    time::Instant,
+};
 
-const MAX_HEADER_BYTES: usize = 16 * 1024;
-const MAX_HEADER_LINES: usize = 128;
-const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
-/// How many times to retry check_server when the data connection is rejected.
-const MAX_TOKEN_RETRIES: usize = 3;
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
+type PendingAcks = Arc<Mutex<HashMap<u32, channel::Sender<bool>>>>;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -29,6 +39,7 @@ struct Cli {
     /// User id
     #[arg(long)]
     user: String,
+
     /// Local server address
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -37,14 +48,12 @@ struct Cli {
     port: u16,
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
-
 fn main() {
     let cli = Cli::parse();
 
     let start = Instant::now();
     let token = task::block_on(check_server(&cli.endpoint, &cli.user));
-    println!("Check server use time: {:?}", start.elapsed());
+    println!("[mux] check_server took {:?}", start.elapsed());
 
     let token = match token {
         Some(t) => t,
@@ -52,189 +61,293 @@ fn main() {
     };
 
     let addr = format!("{}:{}", cli.host, cli.port);
-    task::block_on(run(cli.endpoint.clone(), addr, cli.user.clone(), token));
+    task::block_on(run(cli.endpoint, addr, token));
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn normalize_endpoint(endpoint: &str) -> String {
-    if endpoint.ends_with('/') {
-        endpoint.to_string()
-    } else {
-        format!("{}/", endpoint)
-    }
-}
-
-fn build_request(
-    url_str: &str,
-    token: &str,
-) -> Result<
-    async_tungstenite::tungstenite::http::Request<()>,
-    async_tungstenite::tungstenite::http::Error,
-> {
-    let uri = Uri::from_str(url_str).map_err(|e| {
-        async_tungstenite::tungstenite::http::Error::from(e)
-    })?;
-    let host_str = uri.host().unwrap_or(url_str);
-
+fn build_request(url_str: &str) -> Result<Request<()>, async_tungstenite::tungstenite::http::Error> {
+    let uri = Uri::from_str(url_str).unwrap();
     Request::builder()
         .uri(url_str)
-        .header("Host", host_str)
-        .header(protocol::HEADER_TOKEN, token)
+        .header("Host", uri.host().unwrap())
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
-        .header(
-            "Sec-WebSocket-Key",
-            async_tungstenite::tungstenite::handshake::client::generate_key(),
-        )
+        .header("Sec-WebSocket-Key", generate_key())
         .body(())
 }
 
-// ── Server health-check / token acquisition ───────────────────────────────────
-
-/// Connects to the control endpoint, exchanges Hello/Hi, and returns the token.
-/// Returns None if the server rejects the connection.
+/// Handshake with /control, verify version and user, return the session token.
 async fn check_server(endpoint: &str, user_id: &str) -> Option<String> {
-    let base = normalize_endpoint(endpoint);
-    let url = format!("{}{}", base, protocol::CONTROL_PATH);
     let app_version = env!("CARGO_PKG_VERSION");
-
-    let (mut ws_stream, _) = match connect_async(&url).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to connect to control endpoint: {}", e);
-            return None;
-        }
-    };
-
-    let hello = format!("{}{}:{}", protocol::HELLO_PREFIX, app_version, user_id);
-    if let Err(e) = ws_stream.send(Message::Text(hello.into())).await {
-        eprintln!("Failed to send Hello: {}", e);
-        return None;
+    let mut base = endpoint.to_string();
+    if !base.ends_with('/') {
+        base.push('/');
     }
-    if let Err(e) = ws_stream.flush().await {
-        eprintln!("Failed to flush: {}", e);
-        return None;
-    }
+    let (mut ws, _) = connect_async(format!("{}control", base))
+        .await
+        .expect("[mux] failed to connect to /control");
 
-    let msg = match ws_stream.next().await {
-        Some(Ok(m)) => m,
-        _ => {
-            eprintln!("No response from control endpoint");
-            return None;
-        }
-    };
+    ws.send(Message::Text(
+        format!("Hello:{}:{}", app_version, user_id).into(),
+    ))
+    .await
+    .unwrap();
+    ws.flush().await.unwrap();
 
-    let text = match msg.to_text() {
-        Ok(t) => t.to_string(),
-        Err(_) => {
-            eprintln!("Non-text response from control endpoint");
-            return None;
-        }
-    };
-
-    if let Some(token) = text.strip_prefix(protocol::HI_PREFIX) {
+    let msg = ws.next().await?.ok()?;
+    let text = msg.to_text().ok()?;
+    if let Some(token) = text.strip_prefix("Hi:") {
         Some(token.to_string())
     } else {
-        let reason = text.strip_prefix(protocol::BYE_PREFIX).unwrap_or(&text);
-        println!("{}", reason);
+        println!("{}", text.strip_prefix("Bye:").unwrap_or(text));
         None
     }
 }
 
-// ── Main proxy loop ───────────────────────────────────────────────────────────
+async fn run(endpoint: String, addr: String, token: String) {
+    let mux_url = {
+        let mut base = endpoint.clone();
+        if !base.ends_with('/') {
+            base.push('/');
+        }
+        format!("{}mux", base)
+    };
 
-async fn run(endpoint: String, addr: String, user_id: String, initial_token: String) {
-    let listener = TcpListener::bind(&addr).await.unwrap();
-    println!("http proxy listening on {}", listener.local_addr().unwrap());
+    let (ws_stream, _) = connect_async(build_request(&mux_url).unwrap())
+        .await
+        .expect("[mux] failed to connect to /mux");
 
-    let token = Arc::new(Mutex::new(initial_token));
+    let (ws_sink, ws_src) = ws_stream.split();
 
-    let mut incoming = listener.incoming();
-    while let Some(stream) = incoming.next().await {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("accept error: {}", e);
-                continue;
+    // Send HELLO with token.
+    ws_sink
+        .send(Message::Binary(Frame::Hello(token).encode().into()))
+        .await
+        .expect("[mux] failed to send HELLO");
+
+    let (frame_tx, frame_rx) = frame_channel(128);
+    let registry = StreamRegistry::new();
+    let pending_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+    let next_id = Arc::new(AtomicU32::new(1));
+
+    // Writer loop: frame_rx → ws sink
+    task::spawn(async move {
+        while let Ok(frame) = frame_rx.recv().await {
+            let bytes = frame.encode();
+            if ws_sink
+                .send(Message::Binary(bytes.into()))
+                .await
+                .is_err()
+            {
+                break;
             }
-        };
+        }
+    });
 
-        let endpoint = endpoint.clone();
-        let user_id = user_id.clone();
-        let token = Arc::clone(&token);
-
-        std::thread::spawn(move || {
-            task::block_on(handle_connection(&endpoint, &user_id, token, stream));
+    // Reader loop: ws → Frame → route
+    {
+        let registry = registry.clone();
+        let pending_acks = pending_acks.clone();
+        task::spawn(async move {
+            run_client_reader(ws_src, registry, pending_acks).await;
         });
+    }
+
+    // Accept local HTTP proxy connections.
+    let listener = TcpListener::bind(&addr).await.unwrap();
+    println!("[mux] http proxy listening on {}", listener.local_addr().unwrap());
+
+    while let Ok((stream, _)) = listener.accept().await {
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        let ftx = frame_tx.clone();
+        let reg = registry.clone();
+        let packs = pending_acks.clone();
+        task::spawn(handle_local_connection(stream, id, ftx, reg, packs));
     }
 }
 
-// ── HTTP header parsing ───────────────────────────────────────────────────────
+async fn run_client_reader<S>(
+    mut ws_src: S,
+    registry: StreamRegistry,
+    pending_acks: PendingAcks,
+) where
+    S: futures::Stream<Item = Result<Message, async_tungstenite::tungstenite::Error>>
+        + Unpin
+        + Send
+        + 'static,
+{
+    while let Some(msg) = ws_src.next().await {
+        let data = match msg {
+            Ok(Message::Binary(d)) => d,
+            Ok(Message::Ping(_)) => continue,
+            _ => break,
+        };
+        match Frame::decode(&data) {
+            Ok(Frame::OpenAck { id, ok }) => {
+                if let Some(tx) = pending_acks.lock().unwrap().remove(&id) {
+                    let _ = tx.try_send(ok);
+                }
+            }
+            Ok(Frame::Data { id, bytes }) => {
+                registry.route(id, bytes);
+            }
+            Ok(Frame::Close { id }) => {
+                registry.close(id);
+            }
+            _ => {}
+        }
+    }
+    registry.close_all();
+}
 
-async fn parse_request_header(
+async fn handle_local_connection(
     tcp_stream: TcpStream,
-) -> std::io::Result<(String, String, Vec<u8>)> {
+    stream_id: u32,
+    frame_tx: FrameTx,
+    registry: StreamRegistry,
+    pending_acks: PendingAcks,
+) {
+    let (host, headers, body) =
+        match parse_request_header(tcp_stream.clone()).await {
+            Some(r) => r,
+            None => return,
+        };
+    let is_connect = headers.starts_with("CONNECT ");
+
+    // Register the stream BEFORE sending OPEN to avoid a DATA routing race.
+    let data_rx = registry.register(stream_id);
+
+    // Register a one-shot for OPEN_ACK.
+    let (ack_tx, ack_rx) = channel::bounded::<bool>(1);
+    pending_acks.lock().unwrap().insert(stream_id, ack_tx);
+
+    if frame_tx
+        .send(Frame::Open {
+            id: stream_id,
+            dest: host,
+        })
+        .await
+        .is_err()
+    {
+        registry.close(stream_id);
+        return;
+    }
+
+    let ok = ack_rx.recv().await.unwrap_or(false);
+    if !ok {
+        registry.close(stream_id);
+        let _ = tcp_stream
+            .clone()
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+
+    let mut tcp_stream = tcp_stream;
+
+    if is_connect {
+        if tcp_stream
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await
+            .is_err()
+        {
+            registry.close(stream_id);
+            return;
+        }
+    } else {
+        // Forward the buffered HTTP request as the first DATA frame.
+        let mut request_data = headers.into_bytes();
+        request_data.extend_from_slice(&body);
+        if frame_tx
+            .send(Frame::Data {
+                id: stream_id,
+                bytes: request_data,
+            })
+            .await
+            .is_err()
+        {
+            registry.close(stream_id);
+            return;
+        }
+    }
+
+    let (mut tcp_reader, mut tcp_writer) = tcp_stream.split();
+
+    // ws DATA → tcp write
+    let write_task = task::spawn(async move {
+        while let Ok(data) = data_rx.recv().await {
+            if tcp_writer.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // tcp read → ws DATA
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match tcp_reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if frame_tx
+                    .send(Frame::Data {
+                        id: stream_id,
+                        bytes: buf[..n].to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = frame_tx.send(Frame::Close { id: stream_id }).await;
+    registry.close(stream_id);
+    drop(write_task);
+}
+
+/// Read HTTP request headers and optional body from a cloned TcpStream.
+/// Returns None on malformed input or if limits are exceeded.
+async fn parse_request_header(tcp_stream: TcpStream) -> Option<(String, String, Vec<u8>)> {
     let mut headers = String::new();
     let mut host = String::new();
     let mut content_length: usize = 0;
-    let mut line_count = 0usize;
-
-    let mut reader = async_std::io::BufReader::new(tcp_stream);
+    let mut reader = BufReader::new(tcp_stream);
 
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let n = reader.read_line(&mut line).await.ok()?;
         if n == 0 {
             break;
         }
-
-        line_count += 1;
-        if line_count > MAX_HEADER_LINES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Too many header lines",
-            ));
-        }
         if headers.len() + line.len() > MAX_HEADER_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Headers too large",
-            ));
+            return None;
         }
-
         headers.push_str(&line);
 
-        if line.to_ascii_lowercase().starts_with("host:") {
-            host = line
-                .splitn(2, ':')
-                .nth(1)
-                .unwrap_or("")
+        // Case-insensitive header matching
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("host:") {
+            host = line["host:".len()..]
                 .trim()
+                .trim_end_matches("\r\n")
                 .trim_end_matches('\n')
-                .trim_end_matches('\r')
                 .to_string();
             if !host.contains(':') {
                 host.push_str(":80");
             }
         }
-
-        if line.to_ascii_lowercase().starts_with("content-length:") {
-            let size = line
-                .splitn(2, ':')
-                .nth(1)
-                .and_then(|s| s.trim().parse::<usize>().ok())
+        if lower.starts_with("content-length:") {
+            content_length = line["content-length:".len()..]
+                .trim()
+                .trim_end_matches("\r\n")
+                .trim_end_matches('\n')
+                .parse::<usize>()
                 .unwrap_or(0);
-            if size > MAX_BODY_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Content-Length exceeds limit",
-                ));
+            if content_length > MAX_CONTENT_LENGTH {
+                return None;
             }
-            content_length = size;
         }
-
         if line == "\r\n" {
             break;
         }
@@ -242,226 +355,8 @@ async fn parse_request_header(
 
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body).await?;
+        reader.read_exact(&mut body).await.ok()?;
     }
 
-    Ok((host, headers, body))
-}
-
-// ── Per-connection dispatch ───────────────────────────────────────────────────
-
-async fn handle_connection(
-    remote_server: &str,
-    user_id: &str,
-    token: Arc<Mutex<String>>,
-    mut tcp_stream: TcpStream,
-) {
-    let (host, headers, body) = match parse_request_header(tcp_stream.clone()).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("parse_request_header error: {}", e);
-            let _ = tcp_stream
-                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                .await;
-            return;
-        }
-    };
-
-    let base = normalize_endpoint(remote_server);
-    let ws_url = format!(
-        "{}?{}={}",
-        base,
-        protocol::QUERY_KEY,
-        core_lib::encode_host(&host)
-    );
-    println!("accepted {}", host);
-
-    if headers.starts_with("CONNECT ") {
-        handle_https(ws_url, tcp_stream, user_id, token, remote_server).await;
-    } else {
-        handle_http(ws_url, tcp_stream, headers, body, user_id, token, remote_server).await;
-    }
-}
-
-// ── Token refresh helper ──────────────────────────────────────────────────────
-
-/// Re-runs check_server to obtain a fresh token, updating the shared store.
-async fn refresh_token(
-    remote_server: &str,
-    user_id: &str,
-    token: &Arc<Mutex<String>>,
-) -> Option<String> {
-    for attempt in 0..MAX_TOKEN_RETRIES {
-        if attempt > 0 {
-            async_std::task::sleep(std::time::Duration::from_secs(1)).await;
-        }
-        if let Some(new_token) = check_server(remote_server, user_id).await {
-            *token.lock().unwrap() = new_token.clone();
-            return Some(new_token);
-        }
-    }
-    None
-}
-
-// ── HTTPS tunnel ──────────────────────────────────────────────────────────────
-
-async fn handle_https(
-    ws_url: String,
-    mut tcp_stream: TcpStream,
-    user_id: &str,
-    token: Arc<Mutex<String>>,
-    remote_server: &str,
-) {
-    let ws_stream = connect_with_token_retry(&ws_url, user_id, &token, remote_server).await;
-    let ws_stream = match ws_stream {
-        Some(ws) => ws,
-        None => return,
-    };
-
-    if let Err(e) = tcp_stream
-        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        .await
-    {
-        eprintln!("write 200 error: {}", e);
-        return;
-    }
-    if let Err(e) = tcp_stream.flush().await {
-        eprintln!("flush error: {}", e);
-        return;
-    }
-
-    let (mut tcp_reader, mut tcp_writer) = tcp_stream.split();
-    let (ws_writer, mut ws_reader) = ws_stream.split();
-
-    // ws -> tcp
-    std::thread::spawn(move || {
-        task::block_on(async {
-            while let Some(msg) = ws_reader.next().await {
-                let msg = match msg {
-                    Ok(m) => m,
-                    Err(_) => break,
-                };
-                if msg.is_binary() {
-                    if tcp_writer.write_all(&msg.into_data()).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-    });
-
-    // tcp -> ws
-    std::thread::spawn(move || {
-        task::block_on(async {
-            let mut buf = vec![0u8; 8192];
-            loop {
-                let n = match tcp_reader.read(&mut buf).await {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                if n == 0 {
-                    break;
-                }
-                if ws_writer
-                    .send(Message::Binary(buf[..n].to_vec().into()))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-    });
-}
-
-// ── HTTP proxy ────────────────────────────────────────────────────────────────
-
-async fn handle_http(
-    ws_url: String,
-    mut tcp_stream: TcpStream,
-    headers: String,
-    body: Vec<u8>,
-    user_id: &str,
-    token: Arc<Mutex<String>>,
-    remote_server: &str,
-) {
-    let mut ws_stream = match connect_with_token_retry(&ws_url, user_id, &token, remote_server).await {
-        Some(ws) => ws,
-        None => return,
-    };
-
-    if let Err(e) = ws_stream
-        .send(Message::Binary(headers.as_bytes().to_vec().into()))
-        .await
-    {
-        eprintln!("ws send headers error: {}", e);
-        return;
-    }
-    if !body.is_empty() {
-        if let Err(e) = ws_stream.send(Message::Binary(body.into())).await {
-            eprintln!("ws send body error: {}", e);
-            return;
-        }
-    }
-    if let Err(e) = ws_stream.flush().await {
-        eprintln!("ws flush error: {}", e);
-        return;
-    }
-
-    while let Some(msg) = ws_stream.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(_) => break,
-        };
-        if msg.is_binary() {
-            if tcp_stream.write_all(&msg.into_data()).await.is_err() {
-                break;
-            }
-        }
-    }
-    let _ = tcp_stream.flush().await;
-    let _ = tcp_stream.close().await;
-}
-
-// ── Shared connection helper with token retry ─────────────────────────────────
-
-type WsStream = async_tungstenite::WebSocketStream<
-    async_tungstenite::async_std::ConnectStream,
->;
-
-async fn connect_with_token_retry(
-    ws_url: &str,
-    user_id: &str,
-    token: &Arc<Mutex<String>>,
-    remote_server: &str,
-) -> Option<WsStream> {
-    for attempt in 0..=1 {
-        let t = token.lock().unwrap().clone();
-        let req = match build_request(ws_url, &t) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("build_request error: {}", e);
-                return None;
-            }
-        };
-        match connect_async(req).await {
-            Ok((ws, _)) => return Some(ws),
-            Err(e) => {
-                let msg = e.to_string();
-                if attempt == 0
-                    && (msg.contains("403") || msg.contains("401") || msg.contains("Forbidden"))
-                {
-                    eprintln!("Token rejected, refreshing...");
-                    if refresh_token(remote_server, user_id, token).await.is_none() {
-                        eprintln!("Token refresh failed");
-                        return None;
-                    }
-                } else {
-                    eprintln!("Failed to connect WS: {}", e);
-                    return None;
-                }
-            }
-        }
-    }
-    None
+    Some((host, headers, body))
 }
