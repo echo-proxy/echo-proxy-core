@@ -3,6 +3,14 @@ name = "client"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
+[lib]
+name = "client"
+path = "src/lib.rs"
+
 [dependencies]
 core-lib.workspace = true
 async-std.workspace = true

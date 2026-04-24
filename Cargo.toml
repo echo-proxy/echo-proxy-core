@@ -1,6 +1,6 @@
 
 [workspace]
-members = ["client", "core-lib", "server"]
+members = ["client", "core-lib", "server", "integration-tests"]
 resolver = "2"
 
 [workspace.package]

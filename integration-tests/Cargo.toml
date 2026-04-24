@@ -1,22 +1,17 @@
 [package]
-name = "server"
+name = "integration-tests"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "server"
-path = "src/main.rs"
-
 [lib]
-name = "server"
+name = "integration_tests"
 path = "src/lib.rs"
 
 [dependencies]
+server = { path = "../server" }
+client = { path = "../client" }
 core-lib.workspace = true
-async-std.workspace = true
+async-std = { workspace = true, features = ["attributes"] }
 async-tungstenite = { workspace = true, features = ["async-std-runtime"] }
 futures.workspace = true
-futures-util.workspace = true
-clap.workspace = true
-semver.workspace = true
 uuid.workspace = true
