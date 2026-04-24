@@ -9,3 +9,4 @@ async-std.workspace = true
 async-tungstenite = { workspace = true, features = ["async-native-tls"] }
 clap.workspace = true
 futures.workspace = true
+futures-util.workspace = true

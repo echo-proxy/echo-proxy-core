@@ -8,6 +8,7 @@ core-lib.workspace = true
 async-std.workspace = true
 async-tungstenite = { workspace = true, features = ["async-std-runtime"] }
 futures.workspace = true
+futures-util.workspace = true
 clap.workspace = true
 semver.workspace = true
 uuid.workspace = true
