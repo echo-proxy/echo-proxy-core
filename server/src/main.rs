@@ -2,12 +2,15 @@ use async_std::task;
 use clap::Parser;
 use serde::Deserialize;
 use server::{ServerConfig, bind, make_shutdown_channel, serve};
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Deserialize, Default)]
 struct ServerSection {
     users: Option<Vec<String>>,
     host: Option<String>,
     port: Option<u16>,
+    /// Log level: off, error, warn, info, debug, trace (default: info)
+    log_level: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -46,6 +49,12 @@ fn main() {
     let cli = Cli::parse();
     let file = load_file_config(&cli.config);
 
+    let log_level = file.log_level.as_deref().unwrap_or("info");
+    fmt()
+        .with_env_filter(EnvFilter::new(log_level))
+        .with_target(false)
+        .init();
+
     let users = if !cli.users.is_empty() {
         cli.users
     } else {
@@ -53,8 +62,8 @@ fn main() {
     };
 
     if users.is_empty() {
-        eprintln!(
-            "error: at least one --users entry is required (or set [server] users in config.toml)"
+        tracing::error!(
+            "at least one --users entry is required (or set [server] users in config.toml)"
         );
         std::process::exit(1);
     }

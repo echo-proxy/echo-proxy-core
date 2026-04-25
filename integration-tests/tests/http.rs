@@ -1,6 +1,6 @@
 use integration_tests::{
     http_get_direct, http_get_via_proxy, spawn_http_upstream, spawn_proxy_client,
-    spawn_proxy_server,
+    spawn_proxy_client_with_routing, spawn_proxy_server,
 };
 
 /// A plain `GET /` directly to the server port must return 200 with body `I am running`.
@@ -9,7 +9,11 @@ async fn server_root_returns_i_am_running() {
     let (server_addr, _shutdown) = spawn_proxy_server(vec!["testuser".into()]).await;
     let (status, body) = http_get_direct(server_addr).await;
     assert_eq!(status, 200, "expected HTTP 200");
-    assert_eq!(body, "I am running", "expected body 'I am running', got: {:?}", body);
+    assert_eq!(
+        body, "I am running",
+        "expected body 'I am running', got: {:?}",
+        body
+    );
 }
 
 /// Helper: stand up a full server+client+upstream stack.
@@ -59,4 +63,94 @@ async fn multiple_concurrent_streams() {
             "stream {i}: body missing 'hello-upstream'"
         );
     }
+}
+
+/// A request to a host in the bypass list should be served by direct connection.
+#[async_std::test]
+async fn bypass_rule_connects_directly() {
+    use client::{HostPattern, RoutingConfig};
+
+    let upstream_addr = spawn_http_upstream().await;
+    let host = format!("127.0.0.1:{}", upstream_addr.port());
+
+    let (server_addr, _server_shutdown) = spawn_proxy_server(vec!["testuser".into()]).await;
+
+    let routing = RoutingConfig {
+        proxy: vec![],
+        bypass: vec![HostPattern::parse(&host)],
+        bypass_geosite: None,
+        bypass_cidrs: vec![],
+    };
+    let (proxy_addr, _client_shutdown) =
+        spawn_proxy_client_with_routing(server_addr, "testuser", routing).await;
+
+    let (status, body) = http_get_via_proxy(proxy_addr, &host, "/").await;
+    assert_eq!(status, 200, "expected 200 from direct bypass path");
+    assert!(
+        body.windows(b"hello-upstream".len())
+            .any(|w| w == b"hello-upstream"),
+        "direct bypass body missing 'hello-upstream'"
+    );
+}
+
+/// A CIDR bypass rule must direct-connect when the target IP falls in range.
+#[async_std::test]
+async fn cidr_bypass_connects_directly() {
+    use client::RoutingConfig;
+    use ipnet::IpNet;
+    use std::str::FromStr;
+
+    let upstream_addr = spawn_http_upstream().await;
+    let host = format!("127.0.0.1:{}", upstream_addr.port());
+
+    let (server_addr, _server_shutdown) = spawn_proxy_server(vec!["testuser".into()]).await;
+
+    let routing = RoutingConfig {
+        proxy: vec![],
+        bypass: vec![],
+        bypass_geosite: None,
+        bypass_cidrs: vec![IpNet::from_str("127.0.0.0/8").unwrap()],
+    };
+    let (proxy_addr, _client_shutdown) =
+        spawn_proxy_client_with_routing(server_addr, "testuser", routing).await;
+
+    let (status, body) = http_get_via_proxy(proxy_addr, &host, "/").await;
+    assert_eq!(status, 200, "expected 200 from CIDR bypass path");
+    assert!(
+        body.windows(b"hello-upstream".len())
+            .any(|w| w == b"hello-upstream"),
+        "CIDR bypass body missing 'hello-upstream'"
+    );
+}
+
+/// A proxy rule must override an overlapping bypass rule.
+#[async_std::test]
+async fn proxy_rule_overrides_bypass() {
+    use client::{HostPattern, RoutingConfig};
+
+    let upstream_addr = spawn_http_upstream().await;
+    // Use the hostname "localhost" so the mux server's SSRF check lets it through
+    // (the server only blocks IP-literal loopback/private addresses, not hostnames).
+    let host = format!("localhost:{}", upstream_addr.port());
+
+    let (server_addr, server_shutdown) = spawn_proxy_server(vec!["testuser".into()]).await;
+
+    // Both proxy and bypass lists match — proxy wins, so the request must go via mux.
+    let routing = RoutingConfig {
+        proxy: vec![HostPattern::parse(&host)],
+        bypass: vec![HostPattern::parse(&host)],
+        bypass_geosite: None,
+        bypass_cidrs: vec![],
+    };
+    let (proxy_addr, _client_shutdown) =
+        spawn_proxy_client_with_routing(server_addr, "testuser", routing).await;
+
+    let (status, body) = http_get_via_proxy(proxy_addr, &host, "/").await;
+    assert_eq!(status, 200, "proxy-rule override: expected 200 via tunnel");
+    assert!(
+        body.windows(b"hello-upstream".len())
+            .any(|w| w == b"hello-upstream"),
+        "proxy-rule override: body missing 'hello-upstream'"
+    );
+    drop(server_shutdown);
 }

@@ -1,6 +1,6 @@
 # echo-proxy-core
 
-Echo Proxy is a secure, transparent HTTP/HTTPS proxy tunneled over WebSocket.
+Echo Proxy is a secure HTTP/HTTPS proxy tunneled over WebSocket. Configure your browser or system to use the local client (`127.0.0.1:9002`) as an HTTP proxy; the client forwards traffic to the remote server over a single persistent WebSocket connection.
 
 > **Breaking change (mux protocol):** This version introduces a single persistent
 > WebSocket connection with frame-level multiplexing. Client and server must be
@@ -48,18 +48,85 @@ user = "user1"
 # host = "127.0.0.1"
 # port = 9002
 
+# Routing rules (all optional)
+#
+# proxy   — always tunnel through the remote proxy, even if a bypass rule also matches.
+# bypass  — connect directly, bypassing the remote proxy.
+#
+# Pattern syntax:
+#   example.com         match any port
+#   example.com:8080    match only that port
+#   *.example.com       match any subdomain (not the apex domain itself)
+#   127.0.0.1           plain IP, any port
+#
+# proxy = ["github.com", "*.google.com"]
+# bypass = ["localhost", "127.0.0.1", "*.lan"]
+#
+# If these files exist in the current working directory, the client loads them
+# automatically. Set explicit paths only when the files live elsewhere.
+#
+# Default GeoIP file: geoip-only-cn-private.dat
+# Default GeoSite file: dlc.dat
+#
+# bypass_geoip_dat — path to a V2Ray GeoIP dat file (IP targets only).
+# bypass_geoip_tags — which tags to extract from the dat (default: ["cn", "private"]).
+#
+# Download geoip-only-cn-private.dat from:
+#   https://github.com/v2fly/geoip/releases/latest/download/geoip-only-cn-private.dat
+#
+# bypass_geoip_dat = "geoip-only-cn-private.dat"
+# bypass_geoip_tags = ["cn", "private"]
+#
+# bypass_geosite_dat — path to a V2Ray GeoSite dat file (domain targets).
+# bypass_geosite_tags — which tags to extract (default: ["cn", "private"]).
+#
+# Handles domain-based bypass. Complements bypass_geoip_dat which only
+# matches bare IP addresses. With both configured, most CN traffic will
+# be routed directly regardless of whether the target is a domain or IP.
+#
+# Download dlc.dat from:
+#   https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+#
+# bypass_geosite_dat = "dlc.dat"
+# bypass_geosite_tags = ["cn", "private"]
+#
+# Matching priority (highest first):
+#   1. proxy           — force proxy
+#   2. bypass          — direct connect
+#   3. bypass_geosite  — domain rules, direct connect
+#   4. bypass_geoip    — CIDR rules (IP targets only), direct connect
+#   5. default         — proxy
+#
+# Log level (optional, default: info):
+# Supported values: off, error, warn, info, debug, trace
+# At `info`: each request logs the routing result (direct or proxy).
+# At `debug`: also logs detailed matching reasons and stream-level events.
+#
+# log_level = "info"
+
 [server]
 users = ["user1", "user2"]
 # host = "127.0.0.1"
 # port = 9001
+# log_level = "info"
 ```
 
 Parameter precedence: **CLI flags > config file > built-in defaults**
 
+> CLI flags only cover `endpoint`, `user`, `host`, `port` (client) and `users`, `host`, `port` (server). Routing rules and `log_level` can only be set via the config file.
+
 ### Client
+
+Run the installed binary:
 
 ```bash
 client
+```
+
+Or from source:
+
+```bash
+cargo run -p client
 ```
 
 Override individual values at runtime:
@@ -89,8 +156,16 @@ Options:
 
 ### Server
 
+Run the installed binary:
+
 ```bash
 server
+```
+
+Or from source:
+
+```bash
+cargo run -p server
 ```
 
 Configure your reverse proxy to forward WebSocket traffic to `server`.
@@ -112,12 +187,10 @@ server {
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 }
-```
-
-```bash
-server
 ```
 
 ```

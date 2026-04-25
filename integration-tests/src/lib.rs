@@ -102,6 +102,15 @@ pub async fn spawn_proxy_server(users: Vec<String>) -> (SocketAddr, Sender<()>) 
 /// Start a proxy client connected to `server_addr` as `user`.
 /// Returns `(local_proxy_addr, shutdown_tx)`.
 pub async fn spawn_proxy_client(server_addr: SocketAddr, user: &str) -> (SocketAddr, Sender<()>) {
+    spawn_proxy_client_with_routing(server_addr, user, client::RoutingConfig::default()).await
+}
+
+/// Like [`spawn_proxy_client`] but with explicit routing rules.
+pub async fn spawn_proxy_client_with_routing(
+    server_addr: SocketAddr,
+    user: &str,
+    routing: client::RoutingConfig,
+) -> (SocketAddr, Sender<()>) {
     let endpoint = format!("ws://{}/", server_addr);
     let token = client::obtain_token(&endpoint, user)
         .await
@@ -110,7 +119,9 @@ pub async fn spawn_proxy_client(server_addr: SocketAddr, user: &str) -> (SocketA
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = channel::bounded::<()>(1);
     task::spawn(async move {
-        client::run_proxy(endpoint, listener, token, rx).await.ok();
+        client::run_proxy_with_routing(endpoint, listener, token, rx, routing)
+            .await
+            .ok();
     });
     // Brief yield to let the mux connection be established before tests send traffic.
     task::sleep(std::time::Duration::from_millis(50)).await;
@@ -182,7 +193,10 @@ pub async fn http_get_direct(addr: SocketAddr) -> (u16, String) {
     use futures::io::AsyncBufReadExt;
 
     let stream = TcpStream::connect(addr).await.unwrap();
-    let request = format!("GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", addr);
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        addr
+    );
     (&stream).write_all(request.as_bytes()).await.unwrap();
 
     let mut reader = BufReader::new(&stream);

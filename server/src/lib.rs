@@ -38,7 +38,7 @@ pub async fn serve(
     cfg: ServerConfig,
     shutdown: Receiver<()>,
 ) -> std::io::Result<()> {
-    println!("[mux] listening on {}", listener.local_addr().unwrap());
+    tracing::info!(addr = %listener.local_addr().unwrap(), "mux server listening");
     let token_store: TokenStore = Arc::new(Mutex::new(HashSet::new()));
 
     loop {
@@ -141,6 +141,11 @@ async fn process_control(
     let installed = match Version::parse(client_version) {
         Ok(v) => v,
         Err(_) => {
+            tracing::warn!(
+                user = client_user_id,
+                version = client_version,
+                "invalid version format"
+            );
             let _ = ws_stream
                 .send(Message::Text("Bye:Invalid version format".into()))
                 .await;
@@ -150,6 +155,11 @@ async fn process_control(
     };
     let required = VersionReq::parse(SUPPORTED_VERSION).unwrap();
     if !required.matches(&installed) {
+        tracing::warn!(
+            user = client_user_id,
+            version = client_version,
+            "unsupported version"
+        );
         let _ = ws_stream
             .send(Message::Text(
                 "Bye:Unsupported version. Download from https://github.com/echo-proxy/echo-proxy-core/releases".into(),
@@ -160,6 +170,7 @@ async fn process_control(
     }
 
     if !user_list.contains(&client_user_id.to_string()) {
+        tracing::warn!(user = client_user_id, "user not allowed");
         let _ = ws_stream
             .send(Message::Text("Bye:User not allowed".into()))
             .await;
@@ -169,6 +180,7 @@ async fn process_control(
 
     let token = Uuid::new_v4();
     token_store.lock().unwrap().insert(token);
+    tracing::info!(user = client_user_id, "control handshake ok, token issued");
     let _ = ws_stream
         .send(Message::Text(format!("Hi:{}", token).into()))
         .await;
@@ -196,8 +208,10 @@ async fn run_server_mux_session(ws_stream: WebSocketStream<TcpStream>, token_sto
 
     // Consume the token (single-use; client must reconnect /control if ws drops).
     if !token_store.lock().unwrap().remove(&token_uuid) {
+        tracing::warn!(%token_uuid, "mux HELLO with unknown/already-used token");
         return;
     }
+    tracing::info!("mux session started");
 
     let (frame_tx, frame_rx) = frame_channel(128);
     let registry = StreamRegistry::new();
@@ -239,11 +253,13 @@ async fn run_server_mux_session(ws_stream: WebSocketStream<TcpStream>, token_sto
 
 async fn handle_open(id: u32, dest: String, frame_tx: FrameTx, registry: StreamRegistry) {
     if !is_dest_allowed(&dest) {
+        tracing::warn!(id, dest = %dest, "SSRF: destination blocked");
         let _ = frame_tx.send(Frame::OpenAck { id, ok: false }).await;
         return;
     }
     match TcpStream::connect(&dest).await {
         Ok(tcp) => {
+            tracing::debug!(id, dest = %dest, "stream opened");
             let data_rx = registry.register(id);
             let _ = frame_tx.send(Frame::OpenAck { id, ok: true }).await;
             task::spawn(async move {
@@ -282,7 +298,8 @@ async fn handle_open(id: u32, dest: String, frame_tx: FrameTx, registry: StreamR
                 drop(write_task);
             });
         }
-        Err(_) => {
+        Err(e) => {
+            tracing::warn!(id, dest = %dest, "connect failed: {e}");
             registry.close(id);
             let _ = frame_tx.send(Frame::OpenAck { id, ok: false }).await;
         }
