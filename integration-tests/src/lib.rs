@@ -126,11 +126,7 @@ pub fn endpoint_url(addr: SocketAddr) -> String {
 
 /// Send `GET path HTTP/1.1` through the proxy at `proxy_addr`.
 /// Returns `(status_code, body_bytes)`.
-pub async fn http_get_via_proxy(
-    proxy_addr: SocketAddr,
-    host: &str,
-    path: &str,
-) -> (u16, Vec<u8>) {
+pub async fn http_get_via_proxy(proxy_addr: SocketAddr, host: &str, path: &str) -> (u16, Vec<u8>) {
     use async_std::io::BufReader;
     use futures::io::AsyncBufReadExt;
 

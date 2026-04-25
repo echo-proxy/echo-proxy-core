@@ -11,7 +11,9 @@ async fn control_invalid_version() {
     let url = format!("{}control", endpoint_url(server_addr));
     let (mut ws, _) = connect_async(url.as_str()).await.unwrap();
 
-    ws.send(Message::Text("Hello:abc:user1".into())).await.unwrap();
+    ws.send(Message::Text("Hello:abc:user1".into()))
+        .await
+        .unwrap();
 
     let msg = ws.next().await.unwrap().unwrap();
     let text = msg.to_text().unwrap();
@@ -32,12 +34,7 @@ async fn control_missing_hello_prefix() {
 
     // Server should close without sending a proper reply.
     let next = ws.next().await;
-    let closed = match next {
-        None => true,
-        Some(Ok(Message::Close(_))) => true,
-        Some(Err(_)) => true,
-        _ => false,
-    };
+    let closed = matches!(next, None | Some(Ok(Message::Close(_))) | Some(Err(_)));
     assert!(closed, "expected connection close, got: {:?}", next);
 }
 
@@ -66,12 +63,7 @@ async fn mux_first_frame_must_be_hello() {
         .unwrap();
 
     let next = ws.next().await;
-    let closed = match next {
-        None => true,
-        Some(Ok(Message::Close(_))) => true,
-        Some(Err(_)) => true,
-        _ => false,
-    };
+    let closed = matches!(next, None | Some(Ok(Message::Close(_))) | Some(Err(_)));
     assert!(
         closed,
         "server should close connection when first /mux frame is not HELLO"

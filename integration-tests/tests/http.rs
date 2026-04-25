@@ -1,10 +1,12 @@
-use integration_tests::{http_get_via_proxy, spawn_http_upstream, spawn_proxy_client, spawn_proxy_server};
+use integration_tests::{
+    http_get_via_proxy, spawn_http_upstream, spawn_proxy_client, spawn_proxy_server,
+};
 
 /// Helper: stand up a full server+client+upstream stack.
 /// Returns (upstream_host_str, proxy_addr, shutdown_handles).
 async fn setup() -> (
-    String,                                   // "localhost:PORT"
-    async_std::net::SocketAddr,               // proxy client local port
+    String,                     // "localhost:PORT"
+    async_std::net::SocketAddr, // proxy client local port
     Vec<async_std::channel::Sender<()>>,
 ) {
     let upstream_addr = spawn_http_upstream().await;

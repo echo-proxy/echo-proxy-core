@@ -1,7 +1,7 @@
+use async_std::net::TcpListener;
 use async_std::task;
 use clap::Parser;
 use client::{make_shutdown_channel, obtain_token, run_proxy};
-use async_std::net::TcpListener;
 use serde::Deserialize;
 use std::time::Instant;
 
@@ -52,13 +52,18 @@ fn main() {
     let cli = Cli::parse();
     let file = load_file_config(&cli.config);
 
-    let endpoint = cli.endpoint
-        .or(file.endpoint)
-        .unwrap_or_else(|| { eprintln!("error: --endpoint is required (or set [client] endpoint in config.toml)"); std::process::exit(1); });
-    let user = cli.user
-        .or(file.user)
-        .unwrap_or_else(|| { eprintln!("error: --user is required (or set [client] user in config.toml)"); std::process::exit(1); });
-    let host = cli.host.or(file.host).unwrap_or_else(|| "127.0.0.1".to_string());
+    let endpoint = cli.endpoint.or(file.endpoint).unwrap_or_else(|| {
+        eprintln!("error: --endpoint is required (or set [client] endpoint in config.toml)");
+        std::process::exit(1);
+    });
+    let user = cli.user.or(file.user).unwrap_or_else(|| {
+        eprintln!("error: --user is required (or set [client] user in config.toml)");
+        std::process::exit(1);
+    });
+    let host = cli
+        .host
+        .or(file.host)
+        .unwrap_or_else(|| "127.0.0.1".to_string());
     let port = cli.port.or(file.port).unwrap_or(9002);
 
     let start = Instant::now();

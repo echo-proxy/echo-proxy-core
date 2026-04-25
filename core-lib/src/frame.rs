@@ -134,7 +134,9 @@ mod tests {
 
     #[test]
     fn hello_round_trip() {
-        round_trip(Frame::Hello("550e8400-e29b-41d4-a716-446655440000".to_string()));
+        round_trip(Frame::Hello(
+            "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        ));
     }
 
     #[test]
@@ -188,7 +190,10 @@ mod tests {
 
     #[test]
     fn too_short_returns_error() {
-        assert!(matches!(Frame::decode(&[0x01, 0x00]), Err(FrameError::TooShort)));
+        assert!(matches!(
+            Frame::decode(&[0x01, 0x00]),
+            Err(FrameError::TooShort)
+        ));
         assert!(matches!(Frame::decode(&[]), Err(FrameError::TooShort)));
     }
 
@@ -202,7 +207,10 @@ mod tests {
     #[test]
     fn unknown_type_returns_error() {
         let buf = [0xFF, 0x00, 0x00, 0x00, 0x01];
-        assert!(matches!(Frame::decode(&buf), Err(FrameError::UnknownType(0xFF))));
+        assert!(matches!(
+            Frame::decode(&buf),
+            Err(FrameError::UnknownType(0xFF))
+        ));
     }
 
     #[test]

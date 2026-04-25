@@ -1,5 +1,7 @@
 use futures::{AsyncReadExt, AsyncWriteExt};
-use integration_tests::{connect_via_proxy, spawn_proxy_client, spawn_proxy_server, spawn_raw_echo_upstream};
+use integration_tests::{
+    connect_via_proxy, spawn_proxy_client, spawn_proxy_server, spawn_raw_echo_upstream,
+};
 
 #[async_std::test]
 async fn connect_tunnel_bidirectional() {
@@ -11,7 +13,9 @@ async fn connect_tunnel_bidirectional() {
     let mut tunnel = connect_via_proxy(proxy_addr, &target).await;
 
     // Send 8 KiB of pseudo-random data through the tunnel and verify echo.
-    let payload: Vec<u8> = (0u32..8192).map(|i| (i.wrapping_mul(1664525).wrapping_add(1013904223) & 0xFF) as u8).collect();
+    let payload: Vec<u8> = (0u32..8192)
+        .map(|i| (i.wrapping_mul(1664525).wrapping_add(1013904223) & 0xFF) as u8)
+        .collect();
     tunnel.write_all(&payload).await.unwrap();
 
     let mut received = vec![0u8; payload.len()];

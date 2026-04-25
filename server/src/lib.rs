@@ -4,15 +4,14 @@ use async_std::{
     task,
 };
 use async_tungstenite::{
-    accept_hdr_async,
+    WebSocketStream, accept_hdr_async,
     tungstenite::{
+        Message,
         handshake::server::{Request, Response},
         http::StatusCode,
-        Message,
     },
-    WebSocketStream,
 };
-use core_lib::{frame_channel, Frame, FrameTx, StreamRegistry};
+use core_lib::{Frame, FrameTx, StreamRegistry, frame_channel};
 use futures::{AsyncReadExt, AsyncWriteExt, FutureExt, StreamExt};
 use semver::{Version, VersionReq};
 use std::{
@@ -62,6 +61,7 @@ pub async fn serve(
 
 async fn accept_connection(stream: TcpStream, user_list: Vec<String>, token_store: TokenStore) {
     let mut path = String::new();
+    #[allow(clippy::result_large_err)]
     let callback = |req: &Request, response: Response| {
         path = req.uri().path().to_string();
         if path != "/control" && path != "/mux" {
@@ -184,11 +184,7 @@ async fn run_server_mux_session(ws_stream: WebSocketStream<TcpStream>, token_sto
     task::spawn(async move {
         while let Ok(frame) = frame_rx.recv().await {
             let bytes = frame.encode();
-            if ws_sink
-                .send(Message::Binary(bytes.into()))
-                .await
-                .is_err()
-            {
+            if ws_sink.send(Message::Binary(bytes.into())).await.is_err() {
                 break;
             }
         }
@@ -288,10 +284,7 @@ pub fn is_dest_allowed(dest: &str) -> bool {
 pub fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            !v4.is_loopback()
-            && !v4.is_private()
-            && !v4.is_link_local()
-            && !v4.is_unspecified()
+            !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() && !v4.is_unspecified()
         }
         IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast(),
     }

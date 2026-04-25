@@ -3,9 +3,7 @@ use async_tungstenite::async_std::connect_async;
 use async_tungstenite::tungstenite::Message;
 use core_lib::Frame;
 use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
-use integration_tests::{
-    endpoint_url, spawn_proxy_client, spawn_proxy_server,
-};
+use integration_tests::{endpoint_url, spawn_proxy_client, spawn_proxy_server};
 
 /// An unknown user must get `None` back from `obtain_token`.
 #[async_std::test]
@@ -59,11 +57,9 @@ async fn token_is_single_use() {
     {
         let url = format!("{}mux", endpoint);
         let (mut ws, _) = connect_async(url.as_str()).await.unwrap();
-        ws.send(Message::Binary(
-            Frame::Hello(token.clone()).encode().into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(Message::Binary(Frame::Hello(token.clone()).encode().into()))
+            .await
+            .unwrap();
         // Give the server a moment to consume the token.
         async_std::task::sleep(std::time::Duration::from_millis(50)).await;
         let _ = ws.close(None).await;
@@ -79,12 +75,7 @@ async fn token_is_single_use() {
         // Server should close the connection promptly.
         let next = ws.next().await;
         // Either None (closed) or a Close frame is acceptable.
-        let rejected = match next {
-            None => true,
-            Some(Ok(Message::Close(_))) => true,
-            Some(Err(_)) => true,
-            _ => false,
-        };
+        let rejected = matches!(next, None | Some(Ok(Message::Close(_))) | Some(Err(_)));
         assert!(rejected, "server should have rejected duplicate token");
     }
 }

@@ -53,11 +53,16 @@ fn main() {
     };
 
     if users.is_empty() {
-        eprintln!("error: at least one --users entry is required (or set [server] users in config.toml)");
+        eprintln!(
+            "error: at least one --users entry is required (or set [server] users in config.toml)"
+        );
         std::process::exit(1);
     }
 
-    let host = cli.host.or(file.host).unwrap_or_else(|| "127.0.0.1".to_string());
+    let host = cli
+        .host
+        .or(file.host)
+        .unwrap_or_else(|| "127.0.0.1".to_string());
     let port = cli.port.or(file.port).unwrap_or(9001);
 
     let addr = format!("{}:{}", host, port);

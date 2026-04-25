@@ -7,19 +7,19 @@ use async_std::{
 use async_tungstenite::{
     async_std::connect_async,
     tungstenite::{
+        Message,
         handshake::client::generate_key,
         http::{Request, Uri},
-        Message,
     },
 };
-use core_lib::{frame_channel, Frame, FrameTx, StreamRegistry};
-use futures::{io::AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, FutureExt, SinkExt, StreamExt};
+use core_lib::{Frame, FrameTx, StreamRegistry, frame_channel};
+use futures::{AsyncReadExt, AsyncWriteExt, FutureExt, SinkExt, StreamExt, io::AsyncBufReadExt};
 use std::{
     collections::HashMap,
     str::FromStr,
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
     },
 };
 
@@ -32,7 +32,9 @@ pub fn make_shutdown_channel() -> (channel::Sender<()>, Receiver<()>) {
     channel::bounded(1)
 }
 
-fn build_request(url_str: &str) -> Result<Request<()>, async_tungstenite::tungstenite::http::Error> {
+fn build_request(
+    url_str: &str,
+) -> Result<Request<()>, async_tungstenite::tungstenite::http::Error> {
     let uri = Uri::from_str(url_str).unwrap();
     Request::builder()
         .uri(url_str)
@@ -59,15 +61,11 @@ pub async fn obtain_token_with_version(
     if !base.ends_with('/') {
         base.push('/');
     }
-    let (mut ws, _) = connect_async(format!("{}control", base))
+    let (mut ws, _) = connect_async(format!("{}control", base)).await.ok()?;
+
+    ws.send(Message::Text(format!("Hello:{}:{}", version, user).into()))
         .await
         .ok()?;
-
-    ws.send(Message::Text(
-        format!("Hello:{}:{}", version, user).into(),
-    ))
-    .await
-    .ok()?;
     ws.flush().await.ok()?;
 
     let msg = ws.next().await?.ok()?;
@@ -99,7 +97,7 @@ pub async fn run_proxy(
 
     let (ws_stream, _) = connect_async(build_request(&mux_url).unwrap())
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     let (ws_sink, ws_src) = ws_stream.split();
 
@@ -107,7 +105,7 @@ pub async fn run_proxy(
     ws_sink
         .send(Message::Binary(Frame::Hello(token).encode().into()))
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     let (frame_tx, frame_rx) = frame_channel(128);
     let registry = StreamRegistry::new();
@@ -118,11 +116,7 @@ pub async fn run_proxy(
     task::spawn(async move {
         while let Ok(frame) = frame_rx.recv().await {
             let bytes = frame.encode();
-            if ws_sink
-                .send(Message::Binary(bytes.into()))
-                .await
-                .is_err()
-            {
+            if ws_sink.send(Message::Binary(bytes.into())).await.is_err() {
                 break;
             }
         }
@@ -162,11 +156,8 @@ pub async fn run_proxy(
     Ok(())
 }
 
-async fn run_client_reader<S>(
-    mut ws_src: S,
-    registry: StreamRegistry,
-    pending_acks: PendingAcks,
-) where
+async fn run_client_reader<S>(mut ws_src: S, registry: StreamRegistry, pending_acks: PendingAcks)
+where
     S: futures::Stream<Item = Result<Message, async_tungstenite::tungstenite::Error>>
         + Unpin
         + Send
