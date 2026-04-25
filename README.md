@@ -37,16 +37,48 @@ Connection flow:
 
 ## Usage
 
+### Configuration file
+
+Both `echo-proxy-client` and `echo-proxy-server` load `config.toml` from the current directory by default. Create a single file for both:
+
+```toml
+[client]
+endpoint = "wss://example.org/proxy/"
+user = "user1"
+# host = "127.0.0.1"
+# port = 9002
+
+[server]
+users = ["user1", "user2"]
+# host = "127.0.0.1"
+# port = 9001
+```
+
+Parameter precedence: **CLI flags > config file > built-in defaults**
+
 ### Client
 
 ```bash
-echo-proxy-client --endpoint wss://example.org/proxy/ --user user1
+echo-proxy-client
+```
+
+Override individual values at runtime:
+
+```bash
+echo-proxy-client --user user2 --port 9003
+```
+
+Use a custom config path:
+
+```bash
+echo-proxy-client --config /etc/echo-proxy/config.toml
 ```
 
 ```
-Usage: echo-proxy-client [OPTIONS] --endpoint <ENDPOINT> --user <USER>
+Usage: echo-proxy-client [OPTIONS]
 
 Options:
+      --config <CONFIG>      Path to config file (TOML) [default: config.toml]
       --endpoint <ENDPOINT>  Remote server address
       --user <USER>          User id
       --host <HOST>          Local server address [default: 127.0.0.1]
@@ -56,6 +88,10 @@ Options:
 ```
 
 ### Server
+
+```bash
+echo-proxy-server
+```
 
 Configure your reverse proxy to forward WebSocket traffic to echo-proxy-server.
 
@@ -81,16 +117,17 @@ server {
 ```
 
 ```bash
-echo-proxy-server --user user1 --user user2
+echo-proxy-server
 ```
 
 ```
 Usage: echo-proxy-server [OPTIONS]
 
 Options:
-      --users <USERS>  User id list
-      --host <HOST>    Local server address [default: 127.0.0.1]
-      --port <PORT>    Local server port [default: 9001]
-  -h, --help           Print help
-  -V, --version        Print version
+      --config <CONFIG>  Path to config file (TOML) [default: config.toml]
+      --users <USERS>    Allowed user IDs
+      --host <HOST>      Local server address [default: 127.0.0.1]
+      --port <PORT>      Local server port [default: 9001]
+  -h, --help             Print help
+  -V, --version          Print version
 ```

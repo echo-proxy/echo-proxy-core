@@ -16,5 +16,7 @@ core-lib.workspace = true
 async-std.workspace = true
 async-tungstenite = { workspace = true, features = ["async-native-tls"] }
 clap.workspace = true
+serde.workspace = true
+toml.workspace = true
 futures.workspace = true
 futures-util.workspace = true

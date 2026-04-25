@@ -18,5 +18,7 @@ async-tungstenite = { workspace = true, features = ["async-std-runtime"] }
 futures.workspace = true
 futures-util.workspace = true
 clap.workspace = true
+serde.workspace = true
+toml.workspace = true
 semver.workspace = true
 uuid.workspace = true
