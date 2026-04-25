@@ -1,6 +1,16 @@
 use integration_tests::{
-    http_get_via_proxy, spawn_http_upstream, spawn_proxy_client, spawn_proxy_server,
+    http_get_direct, http_get_via_proxy, spawn_http_upstream, spawn_proxy_client,
+    spawn_proxy_server,
 };
+
+/// A plain `GET /` directly to the server port must return 200 with body `I am running`.
+#[async_std::test]
+async fn server_root_returns_i_am_running() {
+    let (server_addr, _shutdown) = spawn_proxy_server(vec!["testuser".into()]).await;
+    let (status, body) = http_get_direct(server_addr).await;
+    assert_eq!(status, 200, "expected HTTP 200");
+    assert_eq!(body, "I am running", "expected body 'I am running', got: {:?}", body);
+}
 
 /// Helper: stand up a full server+client+upstream stack.
 /// Returns (upstream_host_str, proxy_addr, shutdown_handles).

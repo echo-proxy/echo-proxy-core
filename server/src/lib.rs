@@ -60,6 +60,29 @@ pub async fn serve(
 }
 
 async fn accept_connection(stream: TcpStream, user_list: Vec<String>, token_store: TokenStore) {
+    // Peek at the request headers to distinguish WebSocket upgrades from plain HTTP.
+    // peek() does not consume bytes, so the WebSocket handshake path is unaffected.
+    let mut peek_buf = vec![0u8; 4096];
+    let n = match stream.peek(&mut peek_buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+    let header_bytes = &peek_buf[..n];
+
+    let is_websocket = header_bytes
+        .windows(9)
+        .any(|w| w.eq_ignore_ascii_case(b"websocket"));
+
+    if !is_websocket {
+        let response: &[u8] = if header_bytes.starts_with(b"GET / ") {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nI am running"
+        } else {
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        };
+        let _ = (&stream).write_all(response).await;
+        return;
+    }
+
     let mut path = String::new();
     #[allow(clippy::result_large_err)]
     let callback = |req: &Request, response: Response| {

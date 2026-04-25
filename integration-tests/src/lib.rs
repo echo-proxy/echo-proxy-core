@@ -175,6 +175,51 @@ pub async fn http_get_via_proxy(proxy_addr: SocketAddr, host: &str, path: &str) 
     (status_code, body)
 }
 
+/// Send `GET / HTTP/1.1` directly to `addr` (bypassing the proxy tunnel).
+/// Returns `(status_code, body_string)`.
+pub async fn http_get_direct(addr: SocketAddr) -> (u16, String) {
+    use async_std::io::BufReader;
+    use futures::io::AsyncBufReadExt;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!("GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", addr);
+    (&stream).write_all(request.as_bytes()).await.unwrap();
+
+    let mut reader = BufReader::new(&stream);
+    let mut status_code: u16 = 0;
+    let mut content_length: usize = 0;
+    let mut first_line = true;
+
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await.unwrap_or(0);
+        if n == 0 || line == "\r\n" {
+            break;
+        }
+        if first_line {
+            if let Some(code) = line.split_whitespace().nth(1) {
+                status_code = code.parse().unwrap_or(0);
+            }
+            first_line = false;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("content-length:") {
+            content_length = line["content-length:".len()..]
+                .trim()
+                .trim_end_matches("\r\n")
+                .trim_end_matches('\n')
+                .parse()
+                .unwrap_or(0);
+        }
+    }
+
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body).await.unwrap();
+    }
+    (status_code, String::from_utf8_lossy(&body).into_owned())
+}
+
 /// Issue a CONNECT request through the proxy and return the raw tunnelled
 /// `TcpStream` after receiving `200 Connection established`.
 pub async fn connect_via_proxy(proxy_addr: SocketAddr, target: &str) -> TcpStream {
