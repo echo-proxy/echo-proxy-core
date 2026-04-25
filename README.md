@@ -9,8 +9,8 @@ Echo Proxy is a secure, transparent HTTP/HTTPS proxy tunneled over WebSocket.
 ## Architecture
 
 ```
-Browser → echo-proxy-client (local :9002) ──wss──▶ Nginx ──▶ echo-proxy-server (:9001) → Internet
-                                 one ws connection carries N logical streams
+Browser → client (local :9002) ──wss──▶ Nginx ──▶ server (:9001) → Internet
+                         one ws connection carries N logical streams
 ```
 
 ### Frame wire format
@@ -39,7 +39,7 @@ Connection flow:
 
 ### Configuration file
 
-Both `echo-proxy-client` and `echo-proxy-server` load `config.toml` from the current directory by default. Create a single file for both:
+Both `client` and `server` load `config.toml` from the current directory by default. Create a single file for both:
 
 ```toml
 [client]
@@ -59,23 +59,23 @@ Parameter precedence: **CLI flags > config file > built-in defaults**
 ### Client
 
 ```bash
-echo-proxy-client
+client
 ```
 
 Override individual values at runtime:
 
 ```bash
-echo-proxy-client --user user2 --port 9003
+client --user user2 --port 9003
 ```
 
 Use a custom config path:
 
 ```bash
-echo-proxy-client --config /etc/echo-proxy/config.toml
+client --config /etc/echo-proxy/config.toml
 ```
 
 ```
-Usage: echo-proxy-client [OPTIONS]
+Usage: client [OPTIONS]
 
 Options:
       --config <CONFIG>      Path to config file (TOML) [default: config.toml]
@@ -90,10 +90,10 @@ Options:
 ### Server
 
 ```bash
-echo-proxy-server
+server
 ```
 
-Configure your reverse proxy to forward WebSocket traffic to echo-proxy-server.
+Configure your reverse proxy to forward WebSocket traffic to `server`.
 
 ```nginx
 # example nginx config
@@ -117,11 +117,11 @@ server {
 ```
 
 ```bash
-echo-proxy-server
+server
 ```
 
 ```
-Usage: echo-proxy-server [OPTIONS]
+Usage: server [OPTIONS]
 
 Options:
       --config <CONFIG>  Path to config file (TOML) [default: config.toml]
