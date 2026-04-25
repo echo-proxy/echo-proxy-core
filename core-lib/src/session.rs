@@ -45,12 +45,16 @@ impl StreamRegistry {
         rx
     }
 
-    /// Route a DATA payload to the stream's receiver. Silently drops if the
-    /// stream is not registered or the channel is full (back-pressure exceeded).
-    pub fn route(&self, id: u32, data: Vec<u8>) {
-        let guard = self.inner.lock().unwrap();
-        if let Some(tx) = guard.get(&id) {
-            let _ = tx.try_send(data);
+    /// Route a DATA payload to the stream's receiver.
+    ///
+    /// Blocks (yields) when the channel is full, providing back-pressure that
+    /// propagates to the WebSocket reader and ultimately to the TCP receive
+    /// window.  The Mutex is released before the await so it is never held
+    /// across a yield point.
+    pub async fn route(&self, id: u32, data: Vec<u8>) {
+        let tx = self.inner.lock().unwrap().get(&id).cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send(data).await;
         }
     }
 

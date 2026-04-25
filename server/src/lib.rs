@@ -207,7 +207,7 @@ async fn run_server_mux_session(ws_stream: WebSocketStream<TcpStream>, token_sto
                 handle_open(id, dest, frame_tx.clone(), registry.clone()).await;
             }
             Ok(Frame::Data { id, bytes }) => {
-                registry.route(id, bytes);
+                registry.route(id, bytes).await;
             }
             Ok(Frame::Close { id }) => {
                 registry.close(id);

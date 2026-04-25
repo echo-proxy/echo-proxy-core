@@ -46,6 +46,19 @@ pub async fn spawn_http_upstream() -> SocketAddr {
     addr
 }
 
+/// Spawn an upstream that accepts and immediately drops the connection.
+/// Used to test proxy behaviour when the remote peer closes right away.
+pub async fn spawn_upstream_close_immediately() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    task::spawn(async move {
+        while let Ok((_stream, _)) = listener.accept().await {
+            // Drop stream immediately.
+        }
+    });
+    addr
+}
+
 /// Spawn a raw TCP echo server. Returns the bound address.
 pub async fn spawn_raw_echo_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

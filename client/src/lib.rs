@@ -185,7 +185,7 @@ async fn run_client_reader<S>(
                 }
             }
             Ok(Frame::Data { id, bytes }) => {
-                registry.route(id, bytes);
+                registry.route(id, bytes).await;
             }
             Ok(Frame::Close { id }) => {
                 registry.close(id);
