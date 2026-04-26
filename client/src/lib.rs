@@ -27,6 +27,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
     },
+    time::Duration,
 };
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
@@ -51,13 +52,13 @@ pub struct HostPattern {
 impl HostPattern {
     pub fn parse(s: &str) -> Self {
         let s = s.to_lowercase();
-        if let Some((h, p)) = s.rsplit_once(':') {
-            if let Ok(port) = p.parse::<u16>() {
-                return Self {
-                    host: h.to_string(),
-                    port: Some(port),
-                };
-            }
+        if let Some((h, p)) = s.rsplit_once(':')
+            && let Ok(port) = p.parse::<u16>()
+        {
+            return Self {
+                host: h.to_string(),
+                port: Some(port),
+            };
         }
         Self {
             host: s,
@@ -67,10 +68,10 @@ impl HostPattern {
 
     /// Match against a resolved `host` (lowercase) and numeric `port`.
     fn matches(&self, host: &str, port: u16) -> bool {
-        if let Some(p) = self.port {
-            if p != port {
-                return false;
-            }
+        if let Some(p) = self.port
+            && p != port
+        {
+            return false;
         }
         if self.host.starts_with("*.") {
             let suffix = &self.host[2..];
@@ -120,17 +121,17 @@ impl RoutingConfig {
         }
 
         // 3. GeoSite domain bypass.
-        if let Some(gs) = &self.bypass_geosite {
-            if gs.matches(&h) {
-                return true;
-            }
+        if let Some(gs) = &self.bypass_geosite
+            && gs.matches(&h)
+        {
+            return true;
         }
 
         // 4. CIDR bypass — only when the target is a bare IP address.
-        if let Ok(ip) = h.parse::<IpAddr>() {
-            if self.bypass_cidrs.iter().any(|n| n.contains(&ip)) {
-                return true;
-            }
+        if let Ok(ip) = h.parse::<IpAddr>()
+            && self.bypass_cidrs.iter().any(|n| n.contains(&ip))
+        {
+            return true;
         }
 
         false
@@ -316,6 +317,8 @@ where
         }
     }
     registry.close_all();
+    // Drop all pending ack senders so waiting OPEN_ACK futures unblock immediately.
+    pending_acks.lock().unwrap().clear();
 }
 
 async fn handle_local_connection(
@@ -349,14 +352,18 @@ async fn handle_local_connection(
     tracing::info!(host = %bare_host, port, method = if is_connect { "CONNECT" } else { "plain" }, route = "proxy", "→");
     handle_via_mux(
         tcp_stream,
-        stream_id,
-        frame_tx,
-        registry,
-        pending_acks,
-        host,
-        is_connect,
-        headers,
-        body,
+        MuxState {
+            stream_id,
+            frame_tx,
+            registry,
+            pending_acks,
+        },
+        ProxyRequest {
+            host,
+            is_connect,
+            headers,
+            body,
+        },
     )
     .await;
 }
@@ -433,18 +440,35 @@ async fn relay_tcp(a: TcpStream, b: TcpStream) {
     drop(a_to_b);
 }
 
-/// Forward the connection through the mux WebSocket tunnel.
-async fn handle_via_mux(
-    tcp_stream: TcpStream,
+struct MuxState {
     stream_id: u32,
     frame_tx: FrameTx,
     registry: StreamRegistry,
     pending_acks: PendingAcks,
+}
+
+struct ProxyRequest {
     host: String,
     is_connect: bool,
     headers: String,
     body: Vec<u8>,
-) {
+}
+
+/// Forward the connection through the mux WebSocket tunnel.
+async fn handle_via_mux(tcp_stream: TcpStream, state: MuxState, request: ProxyRequest) {
+    let MuxState {
+        stream_id,
+        frame_tx,
+        registry,
+        pending_acks,
+    } = state;
+    let ProxyRequest {
+        host,
+        is_connect,
+        headers,
+        body,
+    } = request;
+
     // Register the stream BEFORE sending OPEN to avoid a DATA routing race.
     let data_rx = registry.register(stream_id);
 
@@ -589,6 +613,363 @@ async fn parse_request_header(tcp_stream: TcpStream) -> Option<(String, String, 
     }
 
     Some((host, headers, body))
+}
+
+// ── Resilient proxy (mux auto-reconnect) ─────────────────────────────────────
+
+const OPEN_ACK_TIMEOUT_SECS: u64 = 10;
+const RECONNECT_INITIAL_MS: u64 = 500;
+const RECONNECT_MAX_SECS: u64 = 30;
+
+struct MuxConn {
+    frame_tx: FrameTx,
+    registry: StreamRegistry,
+    pending_acks: PendingAcks,
+}
+
+impl MuxConn {
+    /// Drop all pending ack senders and close all streams so in-flight requests
+    /// unblock immediately instead of waiting for the OPEN_ACK timeout.
+    fn close(&self) {
+        self.pending_acks.lock().unwrap().clear();
+        self.registry.close_all();
+    }
+}
+
+type SharedMux = Arc<Mutex<Option<Arc<MuxConn>>>>;
+
+/// Like [`run_proxy_with_routing`] but reconnects the remote WebSocket
+/// automatically when the connection drops (Nginx restart, idle timeout, etc.).
+///
+/// Token acquisition and re-authentication are handled internally; the caller
+/// only needs to supply the `user` identifier used for `/control`.
+pub async fn run_proxy_resilient(
+    endpoint: String,
+    user: String,
+    local_listener: TcpListener,
+    shutdown: Receiver<()>,
+    routing: RoutingConfig,
+) -> std::io::Result<()> {
+    let shared: SharedMux = Arc::new(Mutex::new(None));
+    let next_id = Arc::new(AtomicU32::new(1));
+    let routing = Arc::new(routing);
+
+    // Keeper task: maintains the /mux WebSocket and reconnects when it drops.
+    let (keeper_stop_tx, keeper_stop_rx) = channel::bounded::<()>(1);
+    {
+        let shared = shared.clone();
+        let endpoint = endpoint.clone();
+        task::spawn(async move {
+            run_mux_keeper(endpoint, user, shared, keeper_stop_rx).await;
+        });
+    }
+
+    tracing::info!(
+        addr = %local_listener.local_addr().unwrap(),
+        "http proxy listening"
+    );
+
+    loop {
+        futures::select! {
+            result = local_listener.accept().fuse() => {
+                match result {
+                    Ok((stream, _)) => {
+                        let id = next_id.fetch_add(1, Ordering::Relaxed);
+                        let shared = shared.clone();
+                        let routing = routing.clone();
+                        task::spawn(handle_local_connection_resilient(
+                            stream, id, shared, routing,
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = keeper_stop_tx.try_send(());
+                        return Err(e);
+                    }
+                }
+            }
+            _ = shutdown.recv().fuse() => {
+                let _ = keeper_stop_tx.try_send(());
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_mux_keeper(endpoint: String, user: String, shared: SharedMux, shutdown: Receiver<()>) {
+    let mut backoff = Duration::from_millis(RECONNECT_INITIAL_MS);
+    let max_backoff = Duration::from_secs(RECONNECT_MAX_SECS);
+
+    loop {
+        // Obtain a session token; retry with exponential backoff on failure.
+        let token = loop {
+            match obtain_token(&endpoint, &user).await {
+                Some(t) => {
+                    backoff = Duration::from_millis(RECONNECT_INITIAL_MS);
+                    break t;
+                }
+                None => {
+                    tracing::warn!(delay = ?backoff, "control handshake failed, retrying");
+                    futures::select! {
+                        _ = task::sleep(backoff).fuse() => {}
+                        _ = shutdown.recv().fuse() => return,
+                    }
+                    backoff = (backoff * 2).min(max_backoff);
+                }
+            }
+        };
+
+        // Connect to the /mux endpoint.
+        let mux_url = {
+            let mut base = endpoint.clone();
+            if !base.ends_with('/') {
+                base.push('/');
+            }
+            format!("{}mux", base)
+        };
+
+        let ws_stream = match connect_async(build_request(&mux_url).unwrap()).await {
+            Ok((s, _)) => s,
+            Err(e) => {
+                tracing::warn!(delay = ?backoff, "mux connect failed: {e}, retrying");
+                futures::select! {
+                    _ = task::sleep(backoff).fuse() => {}
+                    _ = shutdown.recv().fuse() => return,
+                }
+                backoff = (backoff * 2).min(max_backoff);
+                continue;
+            }
+        };
+
+        let (ws_sink, ws_src) = ws_stream.split();
+
+        if ws_sink
+            .send(Message::Binary(Frame::Hello(token).encode().into()))
+            .await
+            .is_err()
+        {
+            tracing::warn!("mux HELLO send failed, retrying");
+            continue;
+        }
+
+        backoff = Duration::from_millis(RECONNECT_INITIAL_MS);
+
+        let (frame_tx, frame_rx) = frame_channel(128);
+        let registry = StreamRegistry::new();
+        let pending_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+
+        // Publish the new connection so request handlers can use it.
+        *shared.lock().unwrap() = Some(Arc::new(MuxConn {
+            frame_tx,
+            registry: registry.clone(),
+            pending_acks: pending_acks.clone(),
+        }));
+        tracing::info!("mux session established");
+
+        // Each task sends () when it exits; the first signal wakes the keeper.
+        let (disc_tx, disc_rx) = channel::bounded::<()>(2);
+
+        // Writer loop: frame_rx → ws sink.
+        {
+            let disc_tx = disc_tx.clone();
+            let reg = registry.clone();
+            task::spawn(async move {
+                while let Ok(frame) = frame_rx.recv().await {
+                    let bytes = frame.encode();
+                    if ws_sink.send(Message::Binary(bytes.into())).await.is_err() {
+                        break;
+                    }
+                }
+                reg.close_all();
+                let _ = disc_tx.try_send(());
+            });
+        }
+
+        // Reader loop: ws → Frame → dispatch.
+        {
+            let disc_tx = disc_tx.clone();
+            task::spawn(async move {
+                run_client_reader(ws_src, registry, pending_acks).await;
+                let _ = disc_tx.try_send(());
+            });
+        }
+
+        // Wait for a disconnect signal or a graceful shutdown request.
+        futures::select! {
+            _ = disc_rx.recv().fuse() => {
+                tracing::warn!("mux disconnected, will reconnect");
+                if let Some(c) = shared.lock().unwrap().take() {
+                    c.close();
+                }
+            }
+            _ = shutdown.recv().fuse() => {
+                if let Some(c) = shared.lock().unwrap().take() {
+                    c.close();
+                }
+                return;
+            }
+        }
+    }
+}
+
+async fn handle_local_connection_resilient(
+    tcp_stream: TcpStream,
+    stream_id: u32,
+    shared_mux: SharedMux,
+    routing: Arc<RoutingConfig>,
+) {
+    let (host, headers, body) = match parse_request_header(tcp_stream.clone()).await {
+        Some(r) => r,
+        None => return,
+    };
+    let is_connect = headers.starts_with("CONNECT ");
+
+    let (bare_host, port) = if let Some((h, p)) = host.rsplit_once(':') {
+        let port = p.parse::<u16>().unwrap_or(80);
+        (h.to_string(), port)
+    } else {
+        (host.clone(), 80)
+    };
+
+    if routing.should_bypass(&bare_host, port) {
+        tracing::info!(
+            host = %bare_host, port,
+            method = if is_connect { "CONNECT" } else { "plain" },
+            route = "direct", "→"
+        );
+        handle_direct(tcp_stream, &host, is_connect, headers, body).await;
+        return;
+    }
+
+    tracing::info!(
+        host = %bare_host, port,
+        method = if is_connect { "CONNECT" } else { "plain" },
+        route = "proxy", "→"
+    );
+
+    // Snapshot the current mux connection; return 502 immediately if unavailable.
+    let conn = shared_mux.lock().unwrap().clone();
+    let conn = match conn {
+        Some(c) => c,
+        None => {
+            tracing::warn!(host = %bare_host, "mux unavailable (reconnecting), returning 502");
+            let _ = tcp_stream
+                .clone()
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+    };
+
+    handle_via_mux_with_timeout(tcp_stream, stream_id, conn, host, is_connect, headers, body).await;
+}
+
+/// Like [`handle_via_mux`] but takes an [`Arc<MuxConn>`] snapshot and enforces
+/// an [`OPEN_ACK_TIMEOUT_SECS`] deadline so the browser never hangs indefinitely
+/// when the tunnel is dead.
+async fn handle_via_mux_with_timeout(
+    tcp_stream: TcpStream,
+    stream_id: u32,
+    conn: Arc<MuxConn>,
+    host: String,
+    is_connect: bool,
+    headers: String,
+    body: Vec<u8>,
+) {
+    use async_std::future::timeout;
+
+    let data_rx = conn.registry.register(stream_id);
+    let (ack_tx, ack_rx) = channel::bounded::<bool>(1);
+    conn.pending_acks.lock().unwrap().insert(stream_id, ack_tx);
+
+    if conn
+        .frame_tx
+        .send(Frame::Open {
+            id: stream_id,
+            dest: host,
+        })
+        .await
+        .is_err()
+    {
+        conn.registry.close(stream_id);
+        return;
+    }
+
+    let ok = match timeout(Duration::from_secs(OPEN_ACK_TIMEOUT_SECS), ack_rx.recv()).await {
+        Ok(Ok(v)) => v,
+        _ => false,
+    };
+
+    if !ok {
+        tracing::warn!(stream_id, "OPEN_ACK failed or timed out, returning 502");
+        conn.registry.close(stream_id);
+        let _ = tcp_stream
+            .clone()
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+
+    let mut tcp_stream = tcp_stream;
+
+    if is_connect {
+        if tcp_stream
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await
+            .is_err()
+        {
+            conn.registry.close(stream_id);
+            return;
+        }
+    } else {
+        let mut request_data = headers.into_bytes();
+        request_data.extend_from_slice(&body);
+        if conn
+            .frame_tx
+            .send(Frame::Data {
+                id: stream_id,
+                bytes: request_data,
+            })
+            .await
+            .is_err()
+        {
+            conn.registry.close(stream_id);
+            return;
+        }
+    }
+
+    let (mut tcp_reader, mut tcp_writer) = tcp_stream.split();
+
+    let write_task = task::spawn(async move {
+        while let Ok(data) = data_rx.recv().await {
+            if tcp_writer.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match tcp_reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if conn
+                    .frame_tx
+                    .send(Frame::Data {
+                        id: stream_id,
+                        bytes: buf[..n].to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = conn.frame_tx.send(Frame::Close { id: stream_id }).await;
+    conn.registry.close(stream_id);
+    drop(write_task);
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

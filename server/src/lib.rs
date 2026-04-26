@@ -48,7 +48,8 @@ pub async fn serve(
                     Ok((stream, _)) => {
                         let user_list = cfg.users.clone();
                         let token_store = token_store.clone();
-                        task::spawn(accept_connection(stream, user_list, token_store));
+                        let shutdown = shutdown.clone();
+                        task::spawn(accept_connection(stream, user_list, token_store, shutdown));
                     }
                     Err(e) => return Err(e),
                 }
@@ -59,7 +60,12 @@ pub async fn serve(
     Ok(())
 }
 
-async fn accept_connection(stream: TcpStream, user_list: Vec<String>, token_store: TokenStore) {
+async fn accept_connection(
+    stream: TcpStream,
+    user_list: Vec<String>,
+    token_store: TokenStore,
+    shutdown: Receiver<()>,
+) {
     // Peek at the request headers to distinguish WebSocket upgrades from plain HTTP.
     // peek() does not consume bytes, so the WebSocket handshake path is unaffected.
     let mut peek_buf = vec![0u8; 4096];
@@ -103,9 +109,15 @@ async fn accept_connection(stream: TcpStream, user_list: Vec<String>, token_stor
     };
 
     if path.ends_with("control") {
-        process_control(ws_stream, user_list, token_store).await;
+        futures::select! {
+            _ = process_control(ws_stream, user_list, token_store).fuse() => {}
+            _ = shutdown.recv().fuse() => {}
+        }
     } else {
-        run_server_mux_session(ws_stream, token_store).await;
+        futures::select! {
+            _ = run_server_mux_session(ws_stream, token_store).fuse() => {}
+            _ = shutdown.recv().fuse() => {}
+        }
     }
 }
 

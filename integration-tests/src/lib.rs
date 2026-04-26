@@ -128,6 +128,33 @@ pub async fn spawn_proxy_client_with_routing(
     (addr, tx)
 }
 
+/// Start a **resilient** proxy client that reconnects automatically when the
+/// remote WebSocket drops.  Returns `(local_proxy_addr, shutdown_tx)`.
+pub async fn spawn_resilient_proxy_client(
+    server_addr: SocketAddr,
+    user: &str,
+) -> (SocketAddr, Sender<()>) {
+    let endpoint = format!("ws://{}/", server_addr);
+    let user = user.to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = channel::bounded::<()>(1);
+    task::spawn(async move {
+        client::run_proxy_resilient(
+            endpoint,
+            user,
+            listener,
+            rx,
+            client::RoutingConfig::default(),
+        )
+        .await
+        .ok();
+    });
+    // Brief yield to let the initial mux connection be established.
+    task::sleep(std::time::Duration::from_millis(100)).await;
+    (addr, tx)
+}
+
 /// Convert a SocketAddr to a `ws://` endpoint URL.
 pub fn endpoint_url(addr: SocketAddr) -> String {
     format!("ws://{}/", addr)
