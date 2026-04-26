@@ -18,6 +18,10 @@ struct ClientSection {
     user: Option<String>,
     host: Option<String>,
     port: Option<u16>,
+    /// Local address for the SOCKS5 listener (defaults to `host`).
+    socks_host: Option<String>,
+    /// Local port for the SOCKS5 listener. SOCKS5 is disabled when unset.
+    socks_port: Option<u16>,
     /// Patterns that must always tunnel through the remote proxy.
     proxy: Option<Vec<String>>,
     /// Patterns that must always connect directly.
@@ -59,6 +63,12 @@ struct Cli {
     /// Local server port
     #[arg(long)]
     port: Option<u16>,
+    /// Local SOCKS5 server address (defaults to host)
+    #[arg(long)]
+    socks_host: Option<String>,
+    /// Local SOCKS5 server port (SOCKS5 disabled when unset)
+    #[arg(long)]
+    socks_port: Option<u16>,
 }
 
 fn load_file_config(path: &str) -> ClientSection {
@@ -93,6 +103,12 @@ fn main() {
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let port = cli.port.or(file.port).unwrap_or(9002);
 
+    let socks_host = cli
+        .socks_host
+        .or(file.socks_host)
+        .unwrap_or_else(|| host.clone());
+    let socks_port = cli.socks_port.or(file.socks_port);
+
     // Build routing config.
     let routing = build_routing(
         file.proxy.unwrap_or_default(),
@@ -105,9 +121,17 @@ fn main() {
 
     let addr = format!("{}:{}", host, port);
     task::block_on(async {
-        let listener = TcpListener::bind(&addr).await.unwrap();
+        let http_listener = TcpListener::bind(&addr).await.unwrap();
+
+        let socks_listener = if let Some(sp) = socks_port {
+            let socks_addr = format!("{}:{}", socks_host, sp);
+            Some(TcpListener::bind(&socks_addr).await.unwrap())
+        } else {
+            None
+        };
+
         let (_tx, rx) = make_shutdown_channel();
-        run_proxy_resilient(endpoint, user, listener, rx, routing)
+        run_proxy_resilient(endpoint, user, http_listener, socks_listener, rx, routing)
             .await
             .unwrap();
     });

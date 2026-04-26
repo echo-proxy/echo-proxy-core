@@ -1,16 +1,12 @@
 # echo-proxy-core
 
-Echo Proxy is a secure HTTP/HTTPS proxy tunneled over WebSocket. Configure your browser or system to use the local client (`127.0.0.1:9002`) as an HTTP proxy; the client forwards traffic to the remote server over a single persistent WebSocket connection.
-
-> **Breaking change (mux protocol):** This version introduces a single persistent
-> WebSocket connection with frame-level multiplexing. Client and server must be
-> upgraded together — the old per-request WebSocket protocol is no longer supported.
+Echo Proxy is a secure proxy over WebSocket. Point your browser or system proxy to the local client, and it forwards traffic to the remote server through a single persistent WebSocket connection. 
 
 ## Architecture
 
 ```
-Browser → client (local :9002) ──wss──▶ Nginx ──▶ server (:9001) → Internet
-                         one ws connection carries N logical streams
+Browser ──▶ client ──wss──▶ Nginx ──▶ server ──▶ Internet
+                    one ws connection carries N logical streams
 ```
 
 ### Frame wire format
@@ -47,6 +43,11 @@ endpoint = "wss://example.org/proxy/"
 user = "user1"
 # host = "127.0.0.1"
 # port = 9002
+
+# SOCKS5 proxy (disabled by default).
+# socks_host defaults to host (127.0.0.1) when omitted.
+# socks_port = 9003
+# socks_host = "127.0.0.1"
 
 # Routing rules (all optional)
 #
@@ -145,13 +146,15 @@ client --config /etc/echo-proxy/config.toml
 Usage: client [OPTIONS]
 
 Options:
-      --config <CONFIG>      Path to config file (TOML) [default: config.toml]
-      --endpoint <ENDPOINT>  Remote server address
-      --user <USER>          User id
-      --host <HOST>          Local server address [default: 127.0.0.1]
-      --port <PORT>          Local server port [default: 9002]
-  -h, --help                 Print help
-  -V, --version              Print version
+      --config <CONFIG>        Path to config file (TOML) [default: config.toml]
+      --endpoint <ENDPOINT>    Remote server address
+      --user <USER>            User id
+      --host <HOST>            Local HTTP server address [default: 127.0.0.1]
+      --port <PORT>            Local HTTP server port [default: 9002]
+      --socks-host <SOCKS_HOST>  Local SOCKS5 server address (defaults to host)
+      --socks-port <SOCKS_PORT>  Local SOCKS5 server port (SOCKS5 disabled when unset)
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 ### Server

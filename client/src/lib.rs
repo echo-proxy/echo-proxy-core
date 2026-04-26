@@ -15,7 +15,7 @@ use async_tungstenite::{
         http::{Request, Uri},
     },
 };
-use core_lib::{Frame, FrameTx, StreamRegistry, frame_channel};
+use core_lib::{DataRx, Frame, FrameTx, StreamRegistry, frame_channel};
 use futures::{AsyncReadExt, AsyncWriteExt, FutureExt, SinkExt, StreamExt, io::AsyncBufReadExt};
 use geosite::GeoSiteMatcher;
 use ipnet::IpNet;
@@ -31,6 +31,19 @@ use std::{
 };
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
+
+// ── SOCKS5 constants ──────────────────────────────────────────────────────────
+const SOCKS5_VERSION: u8 = 0x05;
+const SOCKS5_AUTH_NO_AUTH: u8 = 0x00;
+const SOCKS5_AUTH_NO_ACCEPTABLE: u8 = 0xFF;
+const SOCKS5_CMD_CONNECT: u8 = 0x01;
+const SOCKS5_ATYP_IPV4: u8 = 0x01;
+const SOCKS5_ATYP_DOMAIN: u8 = 0x03;
+const SOCKS5_ATYP_IPV6: u8 = 0x04;
+const SOCKS5_REP_SUCCESS: u8 = 0x00;
+const SOCKS5_REP_GENERAL_FAILURE: u8 = 0x01;
+const SOCKS5_REP_CMD_NOT_SUPPORTED: u8 = 0x07;
+const SOCKS5_REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
 type PendingAcks = Arc<Mutex<HashMap<u32, channel::Sender<bool>>>>;
 
@@ -440,6 +453,241 @@ async fn relay_tcp(a: TcpStream, b: TcpStream) {
     drop(a_to_b);
 }
 
+/// Shared mux relay: pump data between `tcp_stream` and the mux `data_rx`/`frame_tx`.
+/// Called after OPEN_ACK succeeds and any protocol-specific success response has been sent.
+async fn do_mux_relay(
+    tcp_stream: TcpStream,
+    stream_id: u32,
+    conn: Arc<MuxConn>,
+    data_rx: DataRx,
+) {
+    let frame_tx = conn.frame_tx.clone();
+    let (mut tcp_reader, mut tcp_writer) = tcp_stream.split();
+
+    let write_task = task::spawn(async move {
+        while let Ok(data) = data_rx.recv().await {
+            if tcp_writer.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match tcp_reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if frame_tx
+                    .send(Frame::Data {
+                        id: stream_id,
+                        bytes: buf[..n].to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = conn.frame_tx.send(Frame::Close { id: stream_id }).await;
+    conn.registry.close(stream_id);
+    drop(write_task);
+}
+
+// ── SOCKS5 helpers ────────────────────────────────────────────────────────────
+
+/// Build a minimal SOCKS5 reply: VER(5) REP ATYP=IPv4 BND=0.0.0.0:0
+fn socks5_reply(rep: u8) -> [u8; 10] {
+    [SOCKS5_VERSION, rep, 0x00, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0, 0]
+}
+
+/// Parse a SOCKS5 greeting + CONNECT request from `stream`.
+///
+/// Handles method negotiation (only NO_AUTH accepted) and returns the target
+/// address as a `"host:port"` string, or `None` on any protocol error.
+/// IPv6 addresses are returned in bracket notation `"[::1]:port"`.
+/// No SOCKS5 success/failure reply is sent here; that is left to the caller.
+async fn parse_socks5_request(stream: &mut TcpStream) -> Option<String> {
+    // --- Greeting ---
+    let mut hdr = [0u8; 2];
+    stream.read_exact(&mut hdr).await.ok()?;
+    if hdr[0] != SOCKS5_VERSION {
+        return None;
+    }
+    let nmethods = hdr[1] as usize;
+    let mut methods = vec![0u8; nmethods];
+    stream.read_exact(&mut methods).await.ok()?;
+
+    if methods.contains(&SOCKS5_AUTH_NO_AUTH) {
+        stream
+            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NO_AUTH])
+            .await
+            .ok()?;
+    } else {
+        let _ = stream
+            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NO_ACCEPTABLE])
+            .await;
+        return None;
+    }
+
+    // --- Request ---
+    let mut req = [0u8; 4]; // VER CMD RSV ATYP
+    stream.read_exact(&mut req).await.ok()?;
+    if req[0] != SOCKS5_VERSION {
+        return None;
+    }
+    let cmd = req[1];
+    let atyp = req[3];
+
+    if cmd != SOCKS5_CMD_CONNECT {
+        let _ = stream.write_all(&socks5_reply(SOCKS5_REP_CMD_NOT_SUPPORTED)).await;
+        return None;
+    }
+
+    let host = match atyp {
+        SOCKS5_ATYP_IPV4 => {
+            let mut addr = [0u8; 4];
+            stream.read_exact(&mut addr).await.ok()?;
+            std::net::Ipv4Addr::from(addr).to_string()
+        }
+        SOCKS5_ATYP_IPV6 => {
+            let mut addr = [0u8; 16];
+            stream.read_exact(&mut addr).await.ok()?;
+            format!("[{}]", std::net::Ipv6Addr::from(addr))
+        }
+        SOCKS5_ATYP_DOMAIN => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await.ok()?;
+            let mut domain = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut domain).await.ok()?;
+            String::from_utf8(domain).ok()?
+        }
+        _ => {
+            let _ = stream.write_all(&socks5_reply(SOCKS5_REP_ATYP_NOT_SUPPORTED)).await;
+            return None;
+        }
+    };
+
+    let mut port_bytes = [0u8; 2];
+    stream.read_exact(&mut port_bytes).await.ok()?;
+    let port = u16::from_be_bytes(port_bytes);
+
+    Some(format!("{}:{}", host, port))
+}
+
+/// Split a `host:port` string and return `(bare_host, port)`.
+/// Strips IPv6 brackets for routing checks: `"[::1]:443"` → `("::1", 443)`.
+fn split_host_port(addr: &str) -> (String, u16) {
+    if let Some((h, p)) = addr.rsplit_once(':') {
+        let port = p.parse::<u16>().unwrap_or(80);
+        let bare = h.trim_matches(|c| c == '[' || c == ']').to_string();
+        (bare, port)
+    } else {
+        (addr.to_string(), 80)
+    }
+}
+
+/// Handle a SOCKS5 connection by connecting directly to the target (bypass path).
+async fn handle_socks_direct(mut tcp_stream: TcpStream, host: &str) {
+    let upstream = match TcpStream::connect(host).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(host, "socks5 direct connect failed: {e}");
+            let _ = tcp_stream.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
+            return;
+        }
+    };
+    let _ = tcp_stream.write_all(&socks5_reply(SOCKS5_REP_SUCCESS)).await;
+    relay_tcp(tcp_stream, upstream).await;
+}
+
+/// Handle a SOCKS5 connection through the mux tunnel (with OPEN_ACK timeout).
+async fn handle_socks_via_mux_with_timeout(
+    mut tcp_stream: TcpStream,
+    stream_id: u32,
+    conn: Arc<MuxConn>,
+    host: String,
+) {
+    use async_std::future::timeout;
+
+    let data_rx = conn.registry.register(stream_id);
+    let (ack_tx, ack_rx) = channel::bounded::<bool>(1);
+    conn.pending_acks.lock().unwrap().insert(stream_id, ack_tx);
+
+    if conn
+        .frame_tx
+        .send(Frame::Open {
+            id: stream_id,
+            dest: host,
+        })
+        .await
+        .is_err()
+    {
+        conn.registry.close(stream_id);
+        let _ = tcp_stream.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
+        return;
+    }
+
+    let ok = match timeout(Duration::from_secs(OPEN_ACK_TIMEOUT_SECS), ack_rx.recv()).await {
+        Ok(Ok(v)) => v,
+        _ => false,
+    };
+
+    if !ok {
+        tracing::warn!(stream_id, "socks5 OPEN_ACK failed or timed out");
+        conn.registry.close(stream_id);
+        let _ = tcp_stream.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
+        return;
+    }
+
+    if tcp_stream
+        .write_all(&socks5_reply(SOCKS5_REP_SUCCESS))
+        .await
+        .is_err()
+    {
+        conn.registry.close(stream_id);
+        return;
+    }
+
+    do_mux_relay(tcp_stream, stream_id, conn, data_rx).await;
+}
+
+/// Accept and handle one incoming SOCKS5 connection in resilient mode.
+async fn handle_socks_connection_resilient(
+    mut tcp_stream: TcpStream,
+    stream_id: u32,
+    shared_mux: SharedMux,
+    routing: Arc<RoutingConfig>,
+) {
+    let host = match parse_socks5_request(&mut tcp_stream).await {
+        Some(h) => h,
+        None => return,
+    };
+
+    let (bare_host, port) = split_host_port(&host);
+
+    if routing.should_bypass(&bare_host, port) {
+        tracing::info!(host = %bare_host, port, route = "direct", "→ socks5");
+        handle_socks_direct(tcp_stream, &host).await;
+        return;
+    }
+
+    tracing::info!(host = %bare_host, port, route = "proxy", "→ socks5");
+
+    let conn = shared_mux.lock().unwrap().clone();
+    let conn = match conn {
+        Some(c) => c,
+        None => {
+            tracing::warn!(host = %bare_host, "mux unavailable (reconnecting), socks5 returning failure");
+            let _ = tcp_stream.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
+            return;
+        }
+    };
+
+    handle_socks_via_mux_with_timeout(tcp_stream, stream_id, conn, host).await;
+}
+
 struct MuxState {
     stream_id: u32,
     frame_tx: FrameTx,
@@ -643,10 +891,14 @@ type SharedMux = Arc<Mutex<Option<Arc<MuxConn>>>>;
 ///
 /// Token acquisition and re-authentication are handled internally; the caller
 /// only needs to supply the `user` identifier used for `/control`.
+///
+/// If `socks_listener` is provided, a SOCKS5 proxy is also started on that
+/// listener, sharing the same mux connection as the HTTP proxy.
 pub async fn run_proxy_resilient(
     endpoint: String,
     user: String,
-    local_listener: TcpListener,
+    http_listener: TcpListener,
+    socks_listener: Option<TcpListener>,
     shutdown: Receiver<()>,
     routing: RoutingConfig,
 ) -> std::io::Result<()> {
@@ -665,13 +917,37 @@ pub async fn run_proxy_resilient(
     }
 
     tracing::info!(
-        addr = %local_listener.local_addr().unwrap(),
+        addr = %http_listener.local_addr().unwrap(),
         "http proxy listening"
     );
 
+    // SOCKS5 listener task (shared mux, same next_id space).
+    if let Some(sl) = socks_listener {
+        tracing::info!(addr = %sl.local_addr().unwrap(), "socks5 proxy listening");
+        let shared = shared.clone();
+        let routing = routing.clone();
+        let next_id = next_id.clone();
+        task::spawn(async move {
+            loop {
+                match sl.accept().await {
+                    Ok((stream, _)) => {
+                        let id = next_id.fetch_add(1, Ordering::Relaxed);
+                        task::spawn(handle_socks_connection_resilient(
+                            stream,
+                            id,
+                            shared.clone(),
+                            routing.clone(),
+                        ));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
     loop {
         futures::select! {
-            result = local_listener.accept().fuse() => {
+            result = http_listener.accept().fuse() => {
                 match result {
                     Ok((stream, _)) => {
                         let id = next_id.fetch_add(1, Ordering::Relaxed);
@@ -938,38 +1214,7 @@ async fn handle_via_mux_with_timeout(
         }
     }
 
-    let (mut tcp_reader, mut tcp_writer) = tcp_stream.split();
-
-    let write_task = task::spawn(async move {
-        while let Ok(data) = data_rx.recv().await {
-            if tcp_writer.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let mut buf = vec![0u8; 8192];
-    loop {
-        match tcp_reader.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if conn
-                    .frame_tx
-                    .send(Frame::Data {
-                        id: stream_id,
-                        bytes: buf[..n].to_vec(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }
-    }
-    let _ = conn.frame_tx.send(Frame::Close { id: stream_id }).await;
-    conn.registry.close(stream_id);
-    drop(write_task);
+    do_mux_relay(tcp_stream, stream_id, conn, data_rx).await;
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

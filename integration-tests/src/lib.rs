@@ -104,7 +104,6 @@ pub async fn spawn_proxy_server(users: Vec<String>) -> (SocketAddr, Sender<()>) 
 pub async fn spawn_proxy_client(server_addr: SocketAddr, user: &str) -> (SocketAddr, Sender<()>) {
     spawn_proxy_client_with_routing(server_addr, user, client::RoutingConfig::default()).await
 }
-
 /// Like [`spawn_proxy_client`] but with explicit routing rules.
 pub async fn spawn_proxy_client_with_routing(
     server_addr: SocketAddr,
@@ -144,6 +143,7 @@ pub async fn spawn_resilient_proxy_client(
             endpoint,
             user,
             listener,
+            None,
             rx,
             client::RoutingConfig::default(),
         )
@@ -153,6 +153,36 @@ pub async fn spawn_resilient_proxy_client(
     // Brief yield to let the initial mux connection be established.
     task::sleep(std::time::Duration::from_millis(100)).await;
     (addr, tx)
+}
+
+/// Start a resilient proxy client with **both** an HTTP and a SOCKS5 listener.
+/// Returns `((http_addr, socks_addr), shutdown_tx)`.
+pub async fn spawn_proxy_client_with_socks(
+    server_addr: SocketAddr,
+    user: &str,
+    routing: client::RoutingConfig,
+) -> ((SocketAddr, SocketAddr), Sender<()>) {
+    let endpoint = format!("ws://{}/", server_addr);
+    let user = user.to_string();
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_addr = socks_listener.local_addr().unwrap();
+    let (tx, rx) = channel::bounded::<()>(1);
+    task::spawn(async move {
+        client::run_proxy_resilient(
+            endpoint,
+            user,
+            http_listener,
+            Some(socks_listener),
+            rx,
+            routing,
+        )
+        .await
+        .ok();
+    });
+    task::sleep(std::time::Duration::from_millis(100)).await;
+    ((http_addr, socks_addr), tx)
 }
 
 /// Convert a SocketAddr to a `ws://` endpoint URL.
@@ -287,5 +317,38 @@ pub async fn connect_via_proxy(proxy_addr: SocketAddr, target: &str) -> TcpStrea
         "Expected 200 from CONNECT, got: {}",
         header
     );
+    stream
+}
+
+/// Perform a SOCKS5 CONNECT handshake to `target` (e.g. `"example.com:80"`)
+/// and return the raw tunnelled `TcpStream` ready for data transfer.
+pub async fn connect_via_socks5(socks_addr: SocketAddr, target: &str) -> TcpStream {
+    let (host, port_str) = target.rsplit_once(':').expect("target must be host:port");
+    let port: u16 = port_str.parse().expect("invalid port");
+
+    let mut stream = TcpStream::connect(socks_addr).await.unwrap();
+
+    // Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth)
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+
+    // Read method selection: VER METHOD
+    let mut sel = [0u8; 2];
+    stream.read_exact(&mut sel).await.unwrap();
+    assert_eq!(sel[0], 0x05, "unexpected SOCKS version");
+    assert_eq!(sel[1], 0x00, "server selected unsupported auth method");
+
+    // Request: VER=5 CMD=1(CONNECT) RSV=0 ATYP=3(DOMAIN) LEN DOMAIN PORT
+    let domain = host.as_bytes();
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
+    req.extend_from_slice(domain);
+    req.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&req).await.unwrap();
+
+    // Reply: VER REP RSV ATYP BND.ADDR(4) BND.PORT(2)
+    let mut reply = [0u8; 10];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[0], 0x05, "unexpected SOCKS version in reply");
+    assert_eq!(reply[1], 0x00, "SOCKS5 CONNECT failed: REP={}", reply[1]);
+
     stream
 }
