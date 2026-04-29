@@ -1,5 +1,5 @@
 use semver::{Version, VersionReq};
-use std::{net::IpAddr, sync::Arc};
+use std::{net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -9,6 +9,8 @@ use tokio::{
 use wtransport::{Connection, Endpoint, Identity, ServerConfig, endpoint::endpoint_side::Server};
 
 const SUPPORTED_VERSION: &str = ">=0.1.0";
+const WEBTRANSPORT_KEEP_ALIVE_SECS: u64 = 10;
+const WEBTRANSPORT_IDLE_TIMEOUT_SECS: u64 = 120;
 
 pub struct ServerOptions {
     pub users: Vec<String>,
@@ -30,6 +32,9 @@ impl ServerEndpoint {
         let config = ServerConfig::builder()
             .with_bind_address(addr)
             .with_identity(opts.identity)
+            .keep_alive_interval(Some(Duration::from_secs(WEBTRANSPORT_KEEP_ALIVE_SECS)))
+            .max_idle_timeout(Some(Duration::from_secs(WEBTRANSPORT_IDLE_TIMEOUT_SECS)))
+            .unwrap_or_else(|_| unreachable!("valid WebTransport idle timeout"))
             .build();
         let endpoint = Endpoint::server(config).map_err(std::io::Error::other)?;
         Ok(Self {

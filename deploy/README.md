@@ -59,8 +59,21 @@ Build the server image:
 docker compose -f deploy/docker-compose.yml build
 ```
 
-Start Envoy and the server:
+Start the server:
 
 ```bash
 docker compose -f deploy/docker-compose.yml up
 ```
+
+The server listens on UDP port `4433`. `gen-certs.sh` prints the SHA-256
+certificate fingerprint; pass it to the client as `--cert-hash`:
+
+```bash
+cargo run -p client -- \
+  --endpoint https://<host>:4433/ \
+  --user alice \
+  --cert-hash <hash printed by gen-certs.sh>
+```
+
+When running with Colima, `<host>` is the Colima VM IP (run `colima ls` or
+`colima ssh -- ip addr show eth0` to find it).

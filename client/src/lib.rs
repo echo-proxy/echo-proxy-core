@@ -19,6 +19,8 @@ use wtransport::{ClientConfig, Connection, Endpoint};
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
 const OPEN_ACK_TIMEOUT_SECS: u64 = 10;
+const WEBTRANSPORT_KEEP_ALIVE_SECS: u64 = 10;
+const WEBTRANSPORT_IDLE_TIMEOUT_SECS: u64 = 120;
 const RECONNECT_INITIAL_MS: u64 = 500;
 const RECONNECT_MAX_SECS: u64 = 30;
 
@@ -128,14 +130,23 @@ impl TlsTrustConfig {
             TlsTrustConfig::NativeCerts => ClientConfig::builder()
                 .with_bind_default()
                 .with_native_certs()
+                .keep_alive_interval(Some(Duration::from_secs(WEBTRANSPORT_KEEP_ALIVE_SECS)))
+                .max_idle_timeout(Some(Duration::from_secs(WEBTRANSPORT_IDLE_TIMEOUT_SECS)))
+                .unwrap_or_else(|_| unreachable!("valid WebTransport idle timeout"))
                 .build(),
             TlsTrustConfig::NoCertValidation => ClientConfig::builder()
                 .with_bind_default()
                 .with_no_cert_validation()
+                .keep_alive_interval(Some(Duration::from_secs(WEBTRANSPORT_KEEP_ALIVE_SECS)))
+                .max_idle_timeout(Some(Duration::from_secs(WEBTRANSPORT_IDLE_TIMEOUT_SECS)))
+                .unwrap_or_else(|_| unreachable!("valid WebTransport idle timeout"))
                 .build(),
             TlsTrustConfig::CertHash(hash) => ClientConfig::builder()
                 .with_bind_default()
                 .with_server_certificate_hashes([hash.clone()])
+                .keep_alive_interval(Some(Duration::from_secs(WEBTRANSPORT_KEEP_ALIVE_SECS)))
+                .max_idle_timeout(Some(Duration::from_secs(WEBTRANSPORT_IDLE_TIMEOUT_SECS)))
+                .unwrap_or_else(|_| unreachable!("valid WebTransport idle timeout"))
                 .build(),
         }
     }
@@ -276,8 +287,20 @@ pub async fn connect_and_auth(
     user: &str,
     config: ClientConfig,
 ) -> Option<Connection> {
-    let ep = Endpoint::client(config).ok()?;
-    let conn = ep.connect(endpoint).await.ok()?;
+    let ep = match Endpoint::client(config) {
+        Ok(ep) => ep,
+        Err(e) => {
+            tracing::debug!("create client endpoint failed: {e}");
+            return None;
+        }
+    };
+    let conn = match ep.connect(endpoint).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::debug!("connect failed: {e}");
+            return None;
+        }
+    };
 
     // Open the auth control stream
     let mut ctrl = match conn.open_bi().await {

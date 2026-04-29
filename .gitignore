@@ -1,4 +1,6 @@
 target
 config.toml
+!.cargo/config.toml
 geoip-*.dat
 dlc.dat
+certs

@@ -55,6 +55,8 @@ struct Cli {
     /// SHA-256 cert hash (hex) for self-signed server certificates.
     #[arg(long)]
     cert_hash: Option<String>,
+    #[arg(long)]
+    log_level: Option<String>,
 }
 
 fn load_file_config(path: &str) -> ClientSection {
@@ -70,7 +72,7 @@ async fn main() {
     let cli = Cli::parse();
     let file = load_file_config(&cli.config);
 
-    let log_level = file.log_level.as_deref().unwrap_or("info");
+    let log_level = cli.log_level.or(file.log_level).unwrap_or_else(|| "info".to_string());
     fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .with_target(false)

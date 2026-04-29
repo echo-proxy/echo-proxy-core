@@ -1,0 +1,6 @@
+.git
+.gitignore
+target
+deploy/certs
+geoip-*.dat
+dlc.dat

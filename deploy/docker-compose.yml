@@ -1,25 +1,24 @@
 # docker-compose for end-to-end WebTransport verification
 #
 # Services
-#   envoy       — HTTP/3 front-end proxy (port 4433 UDP)
-#   echo-server — Rust WebTransport proxy server (port 4434 UDP)
+#   echo-server — Rust WebTransport proxy server (port 4433 UDP)
 #
 # Usage:
-#   # 1. Generate TLS certs for Envoy
+#   # 1. Generate TLS certs
 #   bash deploy/gen-certs.sh
 #
 #   # 2. Build the Rust server image
 #   docker compose -f deploy/docker-compose.yml build
 #
-#   # 3. Start all services
+#   # 3. Start the server
 #   docker compose -f deploy/docker-compose.yml up
 #
-#   # 4. (Optional) Run the client against Envoy
+#   # 4. Run the client
 #   cargo run -p client -- \
-#     --endpoint https://127.0.0.1:4433/ \
+#     --endpoint https://<host>:4433/ \
 #     --user alice \
-#     --cert-hash <hash printed during 'gen-certs.sh'> \
-#     --http 127.0.0.1:8080
+#     --cert-hash <hash printed by gen-certs.sh>
+#
 
 services:
   echo-server:
@@ -28,25 +27,11 @@ services:
       dockerfile: deploy/Dockerfile.server
     command:
       - --host=0.0.0.0
-      - --port=4434
-      - --self-signed
+      - --port=4433
+      - --cert=/etc/echo-proxy/certs/server.crt
+      - --key=/etc/echo-proxy/certs/server.key
       - --users=alice
-    # Expose the UDP port for direct access and for Envoy (host-network variant).
-    # With bridge networking Envoy reaches echo-server at echo-server:4434.
-    ports:
-      - "4434:4434/udp"
-
-  envoy:
-    image: envoyproxy/envoy:v1.33-latest
-    depends_on:
-      - echo-server
     volumes:
-      - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
-      - ./certs:/etc/envoy/certs:ro
-    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info",
-              "--component-log-level", "filter:debug,quic:debug"]
-    environment:
-      RUST_SERVER_HOST: echo-server
+      - ./certs:/etc/echo-proxy/certs:ro
     ports:
-      - "4433:4433/udp"   # QUIC/HTTP3 for WebTransport clients
-      - "9901:9901/tcp"   # Envoy admin
+      - "4433:4433/udp"
