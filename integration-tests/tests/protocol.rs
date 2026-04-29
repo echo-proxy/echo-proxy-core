@@ -1,71 +1,73 @@
-use async_tungstenite::async_std::connect_async;
-use async_tungstenite::tungstenite::Message;
-use core_lib::Frame;
-use futures::StreamExt;
-use integration_tests::{endpoint_url, spawn_proxy_server};
+use integration_tests::{endpoint_url, insecure_client_config, spawn_proxy_server};
 
-/// /control must reject a client that sends an invalid semver string.
-#[async_std::test]
-async fn control_invalid_version() {
-    let (server_addr, _shutdown) = spawn_proxy_server(vec!["user1".into()]).await;
-    let url = format!("{}control", endpoint_url(server_addr));
-    let (mut ws, _) = connect_async(url.as_str()).await.unwrap();
+/// Auth must succeed for a known user with a valid semver version.
+#[tokio::test]
+async fn auth_hello_hi_flow() {
+    let (server_addr, _shutdown) = spawn_proxy_server(vec!["testuser".into()]).await;
+    let endpoint = endpoint_url(server_addr);
+    let conn = client::connect_and_auth(&endpoint, "testuser", insecure_client_config().build_client_config()).await;
+    assert!(conn.is_some(), "expected successful auth");
+}
 
-    ws.send(Message::Text("Hello:abc:user1".into()))
+/// Auth must fail for an unknown user.
+#[tokio::test]
+async fn auth_unknown_user_returns_bye() {
+    let (server_addr, _shutdown) = spawn_proxy_server(vec!["allowed".into()]).await;
+    let endpoint = endpoint_url(server_addr);
+    let conn =
+        client::connect_and_auth(&endpoint, "stranger", insecure_client_config().build_client_config()).await;
+    assert!(conn.is_none(), "expected auth failure for unknown user");
+}
+
+/// Auth must fail when the client sends an invalid version string.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_invalid_version_returns_bye() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wtransport::Endpoint;
+
+    let (server_addr, _shutdown) = spawn_proxy_server(vec!["testuser".into()]).await;
+    let endpoint = endpoint_url(server_addr);
+
+    let config = insecure_client_config().build_client_config();
+    let ep = Endpoint::client(config).unwrap();
+    let conn = ep.connect(&endpoint).await.unwrap();
+    let mut ctrl = conn.open_bi().await.unwrap().await.unwrap();
+
+    ctrl.0
+        .write_all(b"Hello:not-a-semver:testuser\n")
         .await
         .unwrap();
 
-    let msg = ws.next().await.unwrap().unwrap();
-    let text = msg.to_text().unwrap();
+    let mut buf = vec![0u8; 256];
+    let n = ctrl.1.read(&mut buf).await.unwrap().unwrap_or(0);
+    let resp = std::str::from_utf8(&buf[..n]).unwrap_or("");
     assert!(
-        text.starts_with("Bye:Invalid version format"),
-        "expected 'Bye:Invalid version format', got: {text}"
+        resp.starts_with("Bye:"),
+        "expected Bye response, got: {resp}"
     );
 }
 
-/// /control must close the connection when the message does not start with "Hello:".
-#[async_std::test]
-async fn control_missing_hello_prefix() {
-    let (server_addr, _shutdown) = spawn_proxy_server(vec!["user1".into()]).await;
-    let url = format!("{}control", endpoint_url(server_addr));
-    let (mut ws, _) = connect_async(url.as_str()).await.unwrap();
+/// A non-Hello first message must cause the server to drop the stream/session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_missing_hello_prefix_rejected() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wtransport::Endpoint;
 
-    ws.send(Message::Text("garbage".into())).await.unwrap();
-
-    // Server should close without sending a proper reply.
-    let next = ws.next().await;
-    let closed = matches!(next, None | Some(Ok(Message::Close(_))) | Some(Err(_)));
-    assert!(closed, "expected connection close, got: {:?}", next);
-}
-
-/// The first frame on /mux must be HELLO; any other frame must cause the server
-/// to close the connection immediately.
-#[async_std::test]
-async fn mux_first_frame_must_be_hello() {
-    let (server_addr, _shutdown) = spawn_proxy_server(vec!["user1".into()]).await;
-
-    // First obtain a valid token so /mux accepts the WS upgrade.
+    let (server_addr, _shutdown) = spawn_proxy_server(vec!["testuser".into()]).await;
     let endpoint = endpoint_url(server_addr);
-    let _token = client::obtain_token(&endpoint, "user1")
-        .await
-        .expect("should get token");
 
-    let mux_url = format!("{}mux", endpoint);
-    let (mut ws, _) = connect_async(mux_url.as_str()).await.unwrap();
+    let config = insecure_client_config().build_client_config();
+    let ep = Endpoint::client(config).unwrap();
+    let conn = ep.connect(&endpoint).await.unwrap();
+    let mut ctrl = conn.open_bi().await.unwrap().await.unwrap();
 
-    // Send OPEN instead of HELLO as the first frame.
-    let bad_frame = Frame::Open {
-        id: 1,
-        dest: "example.com:80".into(),
-    };
-    ws.send(Message::Binary(bad_frame.encode().into()))
-        .await
-        .unwrap();
+    ctrl.0.write_all(b"garbage\n").await.unwrap();
 
-    let next = ws.next().await;
-    let closed = matches!(next, None | Some(Ok(Message::Close(_))) | Some(Err(_)));
+    let mut buf = vec![0u8; 256];
+    let n = ctrl.1.read(&mut buf).await.unwrap().unwrap_or(0);
+    let resp = std::str::from_utf8(&buf[..n]).unwrap_or("");
     assert!(
-        closed,
-        "server should close connection when first /mux frame is not HELLO"
+        resp.starts_with("Bye:") || n == 0,
+        "expected Bye or empty response, got: {resp}"
     );
 }

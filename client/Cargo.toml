@@ -12,14 +12,12 @@ name = "client"
 path = "src/lib.rs"
 
 [dependencies]
-core-lib.workspace = true
-async-std.workspace = true
-async-tungstenite = { workspace = true, features = ["async-native-tls"] }
+wtransport.workspace = true
+tokio.workspace = true
+futures.workspace = true
 clap.workspace = true
 serde.workspace = true
 toml.workspace = true
-futures.workspace = true
-futures-util.workspace = true
 ipnet.workspace = true
 geosite-rs.workspace = true
 regex.workspace = true

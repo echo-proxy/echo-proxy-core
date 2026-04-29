@@ -1,17 +1,13 @@
-use futures::{AsyncReadExt, AsyncWriteExt};
 use integration_tests::{
-    connect_via_socks5, spawn_http_upstream, spawn_proxy_client_with_socks, spawn_proxy_server,
+    connect_via_socks5, http_get_via_proxy, spawn_http_upstream, spawn_proxy_client_with_socks,
+    spawn_proxy_server,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Read an HTTP/1.1 response from `stream` and return `(status, body)`.
-/// Uses `Content-Length` to read exactly the body bytes without blocking on EOF.
-async fn read_http_response(
-    stream: &mut async_std::net::TcpStream,
-) -> (u16, Vec<u8>) {
-    use async_std::io::BufReader;
-    use futures::io::AsyncBufReadExt;
+async fn read_http_response(stream: &mut tokio::net::TcpStream) -> (u16, Vec<u8>) {
+    use tokio::io::AsyncBufReadExt;
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = tokio::io::BufReader::new(stream);
     let mut status: u16 = 0;
     let mut content_length: usize = 0;
 
@@ -44,13 +40,11 @@ async fn read_http_response(
     (status, body)
 }
 
-/// Helper: stand up server + upstream + client-with-socks.
-/// Returns (upstream_host, http_addr, socks_addr, shutdown_handles).
 async fn setup() -> (
     String,
-    async_std::net::SocketAddr,
-    async_std::net::SocketAddr,
-    Vec<async_std::channel::Sender<()>>,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    Vec<tokio::sync::broadcast::Sender<()>>,
 ) {
     let upstream_addr = spawn_http_upstream().await;
     let (server_addr, server_shutdown) = spawn_proxy_server(vec!["testuser".into()]).await;
@@ -64,9 +58,9 @@ async fn setup() -> (
     (host, http_addr, socks_addr, vec![server_shutdown, client_shutdown])
 }
 
-/// SOCKS5 CONNECT via mux should successfully tunnel to the upstream.
-#[async_std::test]
-async fn socks5_connect_via_mux() {
+/// SOCKS5 CONNECT via tunnel must successfully forward to the upstream.
+#[tokio::test]
+async fn socks5_connect_via_tunnel() {
     let (host, _http_addr, socks_addr, _shutdown) = setup().await;
 
     let mut stream = connect_via_socks5(socks_addr, &host).await;
@@ -82,8 +76,8 @@ async fn socks5_connect_via_mux() {
     );
 }
 
-/// SOCKS5 CONNECT to a host in the bypass list should direct-connect.
-#[async_std::test]
+/// SOCKS5 CONNECT to a bypassed host should direct-connect.
+#[tokio::test]
 async fn socks5_connect_direct_bypass() {
     use client::{HostPattern, RoutingConfig};
 
@@ -114,11 +108,9 @@ async fn socks5_connect_direct_bypass() {
     );
 }
 
-/// HTTP proxy and SOCKS5 proxy share the same mux: both should work concurrently.
-#[async_std::test]
-async fn http_and_socks5_share_mux() {
-    use integration_tests::http_get_via_proxy;
-
+/// HTTP proxy and SOCKS5 proxy share the same tunnel: both must work concurrently.
+#[tokio::test]
+async fn http_and_socks5_share_tunnel() {
     let (host, http_addr, socks_addr, _shutdown) = setup().await;
 
     let (status, body) = http_get_via_proxy(http_addr, &host, "/").await;
@@ -141,21 +133,19 @@ async fn http_and_socks5_share_mux() {
 }
 
 /// Server must reject an unsupported SOCKS5 CMD (BIND = 2).
-#[async_std::test]
+#[tokio::test]
 async fn socks5_unsupported_command_rejected() {
     let (host, _http_addr, socks_addr, _shutdown) = setup().await;
     let (target_host, port_str) = host.rsplit_once(':').unwrap();
     let port: u16 = port_str.parse().unwrap();
 
-    let mut stream = async_std::net::TcpStream::connect(socks_addr).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(socks_addr).await.unwrap();
 
-    // Greeting
     stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
     let mut sel = [0u8; 2];
     stream.read_exact(&mut sel).await.unwrap();
     assert_eq!(sel[1], 0x00);
 
-    // BIND request (CMD=2)
     let domain = target_host.as_bytes();
     let mut req = vec![0x05, 0x02, 0x00, 0x03, domain.len() as u8];
     req.extend_from_slice(domain);
@@ -164,6 +154,5 @@ async fn socks5_unsupported_command_rejected() {
 
     let mut reply = [0u8; 10];
     stream.read_exact(&mut reply).await.unwrap();
-    // REP must be 0x07 (command not supported)
     assert_eq!(reply[1], 0x07, "expected CMD_NOT_SUPPORTED(0x07), got {}", reply[1]);
 }

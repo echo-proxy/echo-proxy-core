@@ -10,17 +10,13 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 core-lib = { path = "core-lib" }
-async-std = "1.13"
-async-tungstenite = "0.30"
+wtransport = { version = "0.7", features = ["dangerous-configuration"] }
+tokio = { version = "1", features = ["full"] }
 futures = "0.3"
-futures-util = "0.3"
 clap = { version = "4.5", features = ["derive"] }
-base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-rand = "0.9"
 semver = "1.0"
-uuid = { version = "1.17", features = ["v4"] }
 ipnet = "2.12"
 geosite-rs = "0.1"
 regex = "1"

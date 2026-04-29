@@ -1,0 +1,118 @@
+# Envoy front-end proxy for echo-proxy WebTransport
+#
+# Architecture:
+#   Client (wtransport) --[HTTP/3 WebTransport]--> Envoy (this file)
+#                        --[HTTP/3 Extended CONNECT]--> Rust server (server/src/lib.rs)
+#
+# Ports
+#   4433 UDP  — QUIC/HTTP3 listener for clients
+#   4434      — Rust server (WebTransport, started separately)
+#   9901 TCP  — Envoy admin interface
+#
+# Run:
+#   docker compose -f deploy/docker-compose.yml up
+#   # or directly (with certs in place):
+#   envoy -c deploy/envoy.yaml
+
+admin:
+  address:
+    socket_address:
+      protocol: TCP
+      address: 0.0.0.0
+      port_value: 9901
+
+static_resources:
+  listeners:
+    # ── HTTP/3 (QUIC) downstream – accepts WebTransport from clients ──────────
+    - name: listener_quic
+      address:
+        socket_address:
+          protocol: UDP
+          address: 0.0.0.0
+          port_value: 4433
+      udp_listener_config:
+        quic_options: {}
+        downstream_socket_config:
+          prefer_gro: true
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.quic
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.quic.v3.QuicDownstreamTransport
+              downstream_tls_context:
+                common_tls_context:
+                  tls_certificates:
+                    - certificate_chain:
+                        # Replace with a real cert in production; see deploy/gen-certs.sh for a
+                        # self-signed certificate that clients can trust via SHA-256 hash pinning.
+                        filename: /etc/envoy/certs/server.crt
+                      private_key:
+                        filename: /etc/envoy/certs/server.key
+                  alpn_protocols:
+                    - h3
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP3
+                stat_prefix: webtransport_ingress
+                # Enable Extended CONNECT so WebTransport CONNECT requests are accepted.
+                http3_protocol_options:
+                  allow_extended_connect: true
+                route_config:
+                  name: webtransport_route
+                  virtual_hosts:
+                    - name: echo_proxy_backend
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            connect_matcher: {}
+                          route:
+                            cluster: rust_server
+                            upgrade_configs:
+                              - upgrade_type: webtransport
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: rust_server
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # ── Rust WebTransport server (HTTP/3 upstream) ────────────────────────────
+    - name: rust_server
+      connect_timeout: 5s
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: rust_server
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      # In docker-compose: address: echo-server
+                      # In bare-metal local test: address: 127.0.0.1
+                      address: "${RUST_SERVER_HOST:-127.0.0.1}"
+                      port_value: 4434
+      # Force HTTP/3 upstream so WebTransport sessions are forwarded over QUIC.
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http3_protocol_options:
+              # Extended CONNECT must be enabled on the upstream too so that
+              # the WebTransport CONNECT is forwarded correctly.
+              allow_extended_connect: true
+      transport_socket:
+        name: envoy.transport_sockets.quic
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.quic.v3.QuicUpstreamTransport
+          upstream_tls_context:
+            # The Rust server uses a self-signed certificate whose SHA-256 hash
+            # is logged at startup (look for "cert_hash" in server logs).
+            # In production, replace with a CA-signed certificate and set sni
+            # to the server's hostname.
+            sni: localhost

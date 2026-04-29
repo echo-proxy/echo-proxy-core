@@ -3,7 +3,8 @@ name = "core-lib"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "core_lib"
+path = "src/lib.rs"
+
 [dependencies]
-async-std.workspace = true
-base64.workspace = true
-rand.workspace = true

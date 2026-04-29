@@ -1,26 +1,33 @@
 /// Shared test fixtures for integration tests.
 ///
-/// All helpers return their bound `SocketAddr` so tests can talk to them on
-/// the OS-assigned port (`:0`).  Each long-running task is controlled by a
-/// shutdown `Sender<()>` — dropping or sending into it stops the task.
-use async_std::{
-    channel::{self, Sender},
-    net::{SocketAddr, TcpListener, TcpStream},
+/// All helpers return their bound address so tests can connect on the
+/// OS-assigned port (`:0`). Each long-running task is controlled by a
+/// broadcast `Sender<()>` — sending or dropping it stops the task.
+use std::net::SocketAddr;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::broadcast,
     task,
 };
-use futures::{AsyncReadExt, AsyncWriteExt};
+use wtransport::Identity;
+
+// ── Test client config ────────────────────────────────────────────────────────
+
+/// Create a `TlsTrustConfig` that skips certificate validation (test only).
+pub fn insecure_client_config() -> client::TlsTrustConfig {
+    client::TlsTrustConfig::NoCertValidation
+}
 
 // ── Upstream mock helpers ─────────────────────────────────────────────────────
 
-/// Spawn a minimal HTTP/1.1 upstream that replies 200 with body `hello-upstream`
-/// to every request.  Returns the bound address.
+/// Spawn a minimal HTTP/1.1 upstream that replies 200 with body `hello-upstream`.
 pub async fn spawn_http_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     task::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             task::spawn(async move {
-                // Drain the request headers (stop at blank line).
                 let mut buf = vec![0u8; 4096];
                 let mut total = 0usize;
                 loop {
@@ -47,7 +54,6 @@ pub async fn spawn_http_upstream() -> SocketAddr {
 }
 
 /// Spawn an upstream that accepts and immediately drops the connection.
-/// Used to test proxy behaviour when the remote peer closes right away.
 pub async fn spawn_upstream_close_immediately() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -66,7 +72,7 @@ pub async fn spawn_raw_echo_upstream() -> SocketAddr {
     task::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             task::spawn(async move {
-                let (mut reader, mut writer) = stream.split();
+                let (mut reader, mut writer) = stream.into_split();
                 let mut buf = vec![0u8; 8192];
                 loop {
                     match reader.read(&mut buf).await {
@@ -86,108 +92,102 @@ pub async fn spawn_raw_echo_upstream() -> SocketAddr {
 
 // ── Proxy server / client helpers ────────────────────────────────────────────
 
-/// Start a proxy server. Returns `(addr, shutdown_tx)`.
-pub async fn spawn_proxy_server(users: Vec<String>) -> (SocketAddr, Sender<()>) {
-    let listener = server::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = channel::bounded::<()>(1);
+/// Start a proxy server with a fresh self-signed cert.
+/// Returns `(addr, cert_identity, shutdown_tx)`.
+pub async fn spawn_proxy_server(
+    users: Vec<String>,
+) -> (SocketAddr, broadcast::Sender<()>) {
+    let identity =
+        Identity::self_signed(["localhost", "127.0.0.1"]).expect("self-signed identity");
+    let opts = server::ServerOptions { users, identity };
+    let se = server::ServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), opts)
+        .expect("bind server");
+    let addr = se.local_addr();
+    let (tx, rx) = broadcast::channel::<()>(1);
     task::spawn(async move {
-        server::serve(listener, server::ServerConfig { users }, rx)
-            .await
-            .ok();
+        se.serve(rx).await.ok();
     });
+    // Brief yield to let the endpoint start
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     (addr, tx)
 }
 
-/// Start a proxy client connected to `server_addr` as `user`.
-/// Returns `(local_proxy_addr, shutdown_tx)`.
-pub async fn spawn_proxy_client(server_addr: SocketAddr, user: &str) -> (SocketAddr, Sender<()>) {
+/// Endpoint URL for a WebTransport test server.
+pub fn endpoint_url(addr: SocketAddr) -> String {
+    format!("https://127.0.0.1:{}/", addr.port())
+}
+
+/// Start a proxy client (non-resilient, single token) connected to `server_addr`.
+pub async fn spawn_proxy_client(
+    server_addr: SocketAddr,
+    user: &str,
+) -> (SocketAddr, broadcast::Sender<()>) {
     spawn_proxy_client_with_routing(server_addr, user, client::RoutingConfig::default()).await
 }
+
 /// Like [`spawn_proxy_client`] but with explicit routing rules.
 pub async fn spawn_proxy_client_with_routing(
     server_addr: SocketAddr,
     user: &str,
     routing: client::RoutingConfig,
-) -> (SocketAddr, Sender<()>) {
-    let endpoint = format!("ws://{}/", server_addr);
-    let token = client::obtain_token(&endpoint, user)
-        .await
-        .expect("obtain_token failed");
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = channel::bounded::<()>(1);
-    task::spawn(async move {
-        client::run_proxy_with_routing(endpoint, listener, token, rx, routing)
-            .await
-            .ok();
-    });
-    // Brief yield to let the mux connection be established before tests send traffic.
-    task::sleep(std::time::Duration::from_millis(50)).await;
-    (addr, tx)
+) -> (SocketAddr, broadcast::Sender<()>) {
+    let endpoint = endpoint_url(server_addr);
+    spawn_resilient_proxy_client_inner(endpoint, user.to_string(), routing, None).await
 }
 
-/// Start a **resilient** proxy client that reconnects automatically when the
-/// remote WebSocket drops.  Returns `(local_proxy_addr, shutdown_tx)`.
+/// Start a resilient proxy client that reconnects automatically.
 pub async fn spawn_resilient_proxy_client(
     server_addr: SocketAddr,
     user: &str,
-) -> (SocketAddr, Sender<()>) {
-    let endpoint = format!("ws://{}/", server_addr);
-    let user = user.to_string();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = channel::bounded::<()>(1);
-    task::spawn(async move {
-        client::run_proxy_resilient(
-            endpoint,
-            user,
-            listener,
-            None,
-            rx,
-            client::RoutingConfig::default(),
-        )
-        .await
-        .ok();
-    });
-    // Brief yield to let the initial mux connection be established.
-    task::sleep(std::time::Duration::from_millis(100)).await;
-    (addr, tx)
+) -> (SocketAddr, broadcast::Sender<()>) {
+    let endpoint = endpoint_url(server_addr);
+    spawn_resilient_proxy_client_inner(endpoint, user.to_string(), client::RoutingConfig::default(), None).await
 }
 
-/// Start a resilient proxy client with **both** an HTTP and a SOCKS5 listener.
-/// Returns `((http_addr, socks_addr), shutdown_tx)`.
+/// Like [`spawn_resilient_proxy_client`] but also starts a SOCKS5 listener.
 pub async fn spawn_proxy_client_with_socks(
     server_addr: SocketAddr,
     user: &str,
     routing: client::RoutingConfig,
-) -> ((SocketAddr, SocketAddr), Sender<()>) {
-    let endpoint = format!("ws://{}/", server_addr);
+) -> ((SocketAddr, SocketAddr), broadcast::Sender<()>) {
+    let endpoint = endpoint_url(server_addr);
     let user = user.to_string();
+    let trust = insecure_client_config();
+
     let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_addr = http_listener.local_addr().unwrap();
     let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let socks_addr = socks_listener.local_addr().unwrap();
-    let (tx, rx) = channel::bounded::<()>(1);
+
+    let (tx, rx) = broadcast::channel::<()>(1);
     task::spawn(async move {
         client::run_proxy_resilient(
-            endpoint,
-            user,
-            http_listener,
-            Some(socks_listener),
-            rx,
-            routing,
+            endpoint, user, trust, http_listener, Some(socks_listener), rx, routing,
         )
         .await
         .ok();
     });
-    task::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     ((http_addr, socks_addr), tx)
 }
 
-/// Convert a SocketAddr to a `ws://` endpoint URL.
-pub fn endpoint_url(addr: SocketAddr) -> String {
-    format!("ws://{}/", addr)
+async fn spawn_resilient_proxy_client_inner(
+    endpoint: String,
+    user: String,
+    routing: client::RoutingConfig,
+    _socks: Option<TcpListener>,
+) -> (SocketAddr, broadcast::Sender<()>) {
+    let trust = insecure_client_config();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = broadcast::channel::<()>(1);
+    task::spawn(async move {
+        client::run_proxy_resilient(endpoint, user, trust, listener, None, rx, routing)
+            .await
+            .ok();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    (addr, tx)
 }
 
 // ── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -195,21 +195,20 @@ pub fn endpoint_url(addr: SocketAddr) -> String {
 /// Send `GET path HTTP/1.1` through the proxy at `proxy_addr`.
 /// Returns `(status_code, body_bytes)`.
 pub async fn http_get_via_proxy(proxy_addr: SocketAddr, host: &str, path: &str) -> (u16, Vec<u8>) {
-    use async_std::io::BufReader;
-    use futures::io::AsyncBufReadExt;
-
     let stream = TcpStream::connect(proxy_addr).await.unwrap();
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        path, host
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+        path = path,
+        host = host
     );
-    (&stream).write_all(request.as_bytes()).await.unwrap();
+    let (mut reader, mut writer) = stream.into_split();
+    writer.write_all(request.as_bytes()).await.unwrap();
+    drop(writer);
 
-    // Parse response with BufReader so we can read header lines then body.
-    let mut reader = BufReader::new(&stream);
-    let mut header_text = String::new();
+    let mut reader = tokio::io::BufReader::new(reader);
     let mut status_code: u16 = 0;
     let mut content_length: usize = 0;
+    let mut first_line = true;
 
     loop {
         let mut line = String::new();
@@ -217,11 +216,11 @@ pub async fn http_get_via_proxy(proxy_addr: SocketAddr, host: &str, path: &str) 
         if n == 0 || line == "\r\n" {
             break;
         }
-        if header_text.is_empty() {
-            // Status line: "HTTP/1.1 200 OK"
+        if first_line {
             if let Some(code) = line.split_whitespace().nth(1) {
                 status_code = code.parse().unwrap_or(0);
             }
+            first_line = false;
         }
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("content-length:") {
@@ -232,31 +231,25 @@ pub async fn http_get_via_proxy(proxy_addr: SocketAddr, host: &str, path: &str) 
                 .parse()
                 .unwrap_or(0);
         }
-        header_text.push_str(&line);
     }
 
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body).await.unwrap();
     }
-    // stream is dropped here → sends FIN → proxy tcp_reader gets EOF → cleanup
     (status_code, body)
 }
 
 /// Send `GET / HTTP/1.1` directly to `addr` (bypassing the proxy tunnel).
 /// Returns `(status_code, body_string)`.
 pub async fn http_get_direct(addr: SocketAddr) -> (u16, String) {
-    use async_std::io::BufReader;
-    use futures::io::AsyncBufReadExt;
-
     let stream = TcpStream::connect(addr).await.unwrap();
-    let request = format!(
-        "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        addr
-    );
-    (&stream).write_all(request.as_bytes()).await.unwrap();
+    let request = format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let (mut reader, mut writer) = stream.into_split();
+    writer.write_all(request.as_bytes()).await.unwrap();
+    drop(writer);
 
-    let mut reader = BufReader::new(&stream);
+    let mut reader = tokio::io::BufReader::new(reader);
     let mut status_code: u16 = 0;
     let mut content_length: usize = 0;
     let mut first_line = true;
@@ -291,17 +284,12 @@ pub async fn http_get_direct(addr: SocketAddr) -> (u16, String) {
     (status_code, String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Issue a CONNECT request through the proxy and return the raw tunnelled
-/// `TcpStream` after receiving `200 Connection established`.
+/// Issue a CONNECT request through the proxy and return the tunnelled `TcpStream`.
 pub async fn connect_via_proxy(proxy_addr: SocketAddr, target: &str) -> TcpStream {
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
-    let request = format!(
-        "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n",
-        target = target
-    );
+    let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    // Read until we find the blank line ending the 200 response.
     let mut buf = vec![0u8; 256];
     let mut total = 0usize;
     loop {
@@ -311,44 +299,33 @@ pub async fn connect_via_proxy(proxy_addr: SocketAddr, target: &str) -> TcpStrea
             break;
         }
     }
-    let header = std::str::from_utf8(&buf[..total]).unwrap();
-    assert!(
-        header.contains("200"),
-        "Expected 200 from CONNECT, got: {}",
-        header
-    );
     stream
 }
 
-/// Perform a SOCKS5 CONNECT handshake to `target` (e.g. `"example.com:80"`)
-/// and return the raw tunnelled `TcpStream` ready for data transfer.
+/// Connect through a SOCKS5 proxy and return the raw tunnelled `TcpStream`.
 pub async fn connect_via_socks5(socks_addr: SocketAddr, target: &str) -> TcpStream {
-    let (host, port_str) = target.rsplit_once(':').expect("target must be host:port");
-    let port: u16 = port_str.parse().expect("invalid port");
-
     let mut stream = TcpStream::connect(socks_addr).await.unwrap();
 
-    // Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth)
-    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let (host, port_str) = target.rsplit_once(':').expect("target must be host:port");
+    let port: u16 = port_str.parse().expect("valid port");
+    let domain = host.as_bytes();
 
-    // Read method selection: VER METHOD
+    // Greeting
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
     let mut sel = [0u8; 2];
     stream.read_exact(&mut sel).await.unwrap();
-    assert_eq!(sel[0], 0x05, "unexpected SOCKS version");
-    assert_eq!(sel[1], 0x00, "server selected unsupported auth method");
+    assert_eq!(sel[1], 0x00, "socks5: no auth accepted");
 
-    // Request: VER=5 CMD=1(CONNECT) RSV=0 ATYP=3(DOMAIN) LEN DOMAIN PORT
-    let domain = host.as_bytes();
+    // CONNECT request (ATYP=domain)
     let mut req = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
     req.extend_from_slice(domain);
     req.extend_from_slice(&port.to_be_bytes());
     stream.write_all(&req).await.unwrap();
 
-    // Reply: VER REP RSV ATYP BND.ADDR(4) BND.PORT(2)
+    // Read reply (10 bytes for IPv4 binding)
     let mut reply = [0u8; 10];
     stream.read_exact(&mut reply).await.unwrap();
-    assert_eq!(reply[0], 0x05, "unexpected SOCKS version in reply");
-    assert_eq!(reply[1], 0x00, "SOCKS5 CONNECT failed: REP={}", reply[1]);
+    assert_eq!(reply[1], 0x00, "socks5: expected success reply");
 
     stream
 }

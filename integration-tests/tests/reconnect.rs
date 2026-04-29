@@ -1,100 +1,132 @@
-use async_std::{future::timeout, task};
-use integration_tests::{http_get_via_proxy, spawn_http_upstream, spawn_resilient_proxy_client};
+use integration_tests::{
+    http_get_via_proxy, insecure_client_config, spawn_http_upstream,
+};
 use std::time::Duration;
 
-/// When no proxy server is reachable, the resilient client must return 502
-/// quickly rather than hanging indefinitely.
-#[async_std::test]
+/// When no proxy server is reachable, the resilient client must return 502 quickly.
+#[tokio::test]
 async fn returns_502_when_no_server_available() {
     let upstream_addr = spawn_http_upstream().await;
     let host = format!("localhost:{}", upstream_addr.port());
 
-    // Bind to a free port then immediately drop the listener so nothing is
-    // reachable on that address.
-    let dummy = server::bind("127.0.0.1:0").await.unwrap();
-    let dead_addr = dummy.local_addr().unwrap();
-    drop(dummy);
-    task::sleep(Duration::from_millis(100)).await;
+    // Pick a port that is not listening
+    let dead_port = {
+        let tmp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        tmp.local_addr().unwrap().port()
+    };
+    // Give OS time to release the port
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Start a resilient client pointed at the dead address.
-    // spawn_resilient_proxy_client waits 100 ms for the mux to establish;
-    // since the server is dead, shared_mux will remain None.
-    let (proxy_addr, _client_shutdown) =
-        spawn_resilient_proxy_client(dead_addr, "testuser").await;
+    let dead_endpoint = format!("https://127.0.0.1:{dead_port}/");
 
-    // Give the keeper one extra cycle to confirm the server is unreachable.
-    task::sleep(Duration::from_millis(300)).await;
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = http_listener.local_addr().unwrap();
+    let (_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let trust = insecure_client_config();
 
-    // Request must return 502 quickly, not hang.
-    let result = timeout(
+    tokio::task::spawn(async move {
+        client::run_proxy_resilient(
+            dead_endpoint,
+            "testuser".to_string(),
+            trust,
+            http_listener,
+            None,
+            shutdown_rx,
+            client::RoutingConfig::default(),
+        )
+        .await
+        .ok();
+    });
+
+    // Give the keeper one cycle to confirm the server is unreachable
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let result = tokio::time::timeout(
         Duration::from_secs(5),
         http_get_via_proxy(proxy_addr, &host, "/"),
     )
     .await;
 
     match result {
-        Ok((status, _)) => assert_eq!(status, 502, "expected 502 when mux is unavailable"),
+        Ok((status, _)) => assert_eq!(status, 502, "expected 502 when session is unavailable"),
         Err(_) => panic!("request timed out instead of returning 502"),
     }
 }
 
-/// After the proxy server restarts on the same address, the resilient client
-/// must reconnect automatically and resume forwarding requests.
-#[async_std::test]
+/// After the proxy server restarts on the same address, the client must reconnect
+/// and resume forwarding requests.
+#[tokio::test]
 async fn recovers_after_server_restart() {
     let upstream_addr = spawn_http_upstream().await;
     let host = format!("localhost:{}", upstream_addr.port());
 
-    // Start the first server and record its port so we can rebind to it.
-    let first_listener = server::bind("127.0.0.1:0").await.unwrap();
-    let server_port = first_listener.local_addr().unwrap().port();
-    let server_addr = first_listener.local_addr().unwrap();
-    let (stop1_tx, stop1_rx) = async_std::channel::bounded::<()>(1);
-    task::spawn(async move {
-        server::serve(
-            first_listener,
-            server::ServerConfig {
-                users: vec!["testuser".into()],
-            },
-            stop1_rx,
+    // Start first server
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"])
+        .expect("self-signed identity");
+    let opts = server::ServerOptions {
+        users: vec!["testuser".into()],
+        identity,
+    };
+    let se = server::ServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), opts)
+        .expect("bind server");
+    let server_addr = se.local_addr();
+    let (stop1_tx, stop1_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let server_port = server_addr.port();
+    let server1_handle = tokio::task::spawn(async move {
+        se.serve(stop1_rx).await.ok();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let endpoint = format!("https://127.0.0.1:{server_port}/");
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = http_listener.local_addr().unwrap();
+    let (_tx2, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let trust = insecure_client_config();
+
+    tokio::task::spawn(async move {
+        client::run_proxy_resilient(
+            endpoint,
+            "testuser".to_string(),
+            trust,
+            http_listener,
+            None,
+            shutdown_rx,
+            client::RoutingConfig::default(),
         )
         .await
         .ok();
     });
 
-    let (proxy_addr, _client_shutdown) =
-        spawn_resilient_proxy_client(server_addr, "testuser").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
-    // 1. Confirm initial access works.
+    // 1. Confirm initial access works
     let (status, _) = http_get_via_proxy(proxy_addr, &host, "/").await;
     assert_eq!(status, 200, "initial request should succeed");
 
-    // 2. Stop the first server.
-    drop(stop1_tx);
-    // Give OS time to release the port.
-    task::sleep(Duration::from_millis(500)).await;
+    // 2. Stop the first server and wait until the UDP port is fully released
+    let _ = stop1_tx.send(());
+    let _ = server1_handle.await; // wait_idle inside serve() ensures port is freed
 
-    // 3. Restart server on the same port.
-    let second_listener = server::bind(&format!("127.0.0.1:{}", server_port))
-        .await
-        .expect("failed to rebind server port after restart");
-    let (_stop2_tx, stop2_rx) = async_std::channel::bounded::<()>(1);
-    task::spawn(async move {
-        server::serve(
-            second_listener,
-            server::ServerConfig {
-                users: vec!["testuser".into()],
-            },
-            stop2_rx,
-        )
-        .await
-        .ok();
+    // 3. Restart server on the same port
+    let rebind_addr: std::net::SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+    let se2 = server::ServerEndpoint::bind(
+        rebind_addr,
+        server::ServerOptions {
+            users: vec!["testuser".into()],
+            identity: wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap(),
+        },
+    )
+    .expect("failed to rebind server port after restart");
+    let (_stop2_tx, stop2_rx) = tokio::sync::broadcast::channel::<()>(1);
+    tokio::task::spawn(async move {
+        se2.serve(stop2_rx).await.ok();
     });
 
-    // 4. Wait for the client to detect the disconnect and reconnect.
-    task::sleep(Duration::from_secs(3)).await;
+    // 4. Wait for client to detect disconnect and reconnect
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // 5. Requests must succeed again without restarting the client.
+    // 5. Requests must succeed again
     let (status, _) = http_get_via_proxy(proxy_addr, &host, "/").await;
     assert_eq!(
         status, 200,

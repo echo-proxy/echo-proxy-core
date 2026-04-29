@@ -1,36 +1,26 @@
 pub mod geoip;
 pub mod geosite;
 
-use async_std::{
-    channel::{self, Receiver},
-    io::BufReader,
-    net::{TcpListener, TcpStream},
-    task,
-};
-use async_tungstenite::{
-    async_std::connect_async,
-    tungstenite::{
-        Message,
-        handshake::client::generate_key,
-        http::{Request, Uri},
-    },
-};
-use core_lib::{DataRx, Frame, FrameTx, StreamRegistry, frame_channel};
-use futures::{AsyncReadExt, AsyncWriteExt, FutureExt, SinkExt, StreamExt, io::AsyncBufReadExt};
 use geosite::GeoSiteMatcher;
 use ipnet::IpNet;
 use std::{
-    collections::HashMap,
     net::IpAddr,
-    str::FromStr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
+    sync::broadcast,
+    task,
+};
+use wtransport::{ClientConfig, Connection, Endpoint};
+
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
+const OPEN_ACK_TIMEOUT_SECS: u64 = 10;
+const RECONNECT_INITIAL_MS: u64 = 500;
+const RECONNECT_MAX_SECS: u64 = 30;
 
 // ── SOCKS5 constants ──────────────────────────────────────────────────────────
 const SOCKS5_VERSION: u8 = 0x05;
@@ -45,17 +35,8 @@ const SOCKS5_REP_GENERAL_FAILURE: u8 = 0x01;
 const SOCKS5_REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS5_REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
-type PendingAcks = Arc<Mutex<HashMap<u32, channel::Sender<bool>>>>;
-
 // ── Routing rules ─────────────────────────────────────────────────────────────
 
-/// A single host-matching rule.
-///
-/// Patterns:
-/// - `example.com`       — matches any port
-/// - `example.com:8080`  — matches only that port
-/// - `*.example.com`     — matches any subdomain (not the apex)
-/// - `127.0.0.1`         — plain IP string, any port
 #[derive(Debug, Clone)]
 pub struct HostPattern {
     host: String,
@@ -79,7 +60,6 @@ impl HostPattern {
         }
     }
 
-    /// Match against a resolved `host` (lowercase) and numeric `port`.
     fn matches(&self, host: &str, port: u16) -> bool {
         if let Some(p) = self.port
             && p != port
@@ -97,311 +77,325 @@ impl HostPattern {
     }
 }
 
-/// Routing configuration passed to [`run_proxy`].
 #[derive(Debug, Default)]
 pub struct RoutingConfig {
-    /// Always tunnel through the remote proxy.
     pub proxy: Vec<HostPattern>,
-    /// Always connect directly (bypass the proxy).
     pub bypass: Vec<HostPattern>,
-    /// Domain rules loaded from a GeoSite dat (e.g. dlc.dat).
     pub bypass_geosite: Option<GeoSiteMatcher>,
-    /// Additional CIDR ranges to bypass (typically CN + private).
     pub bypass_cidrs: Vec<IpNet>,
 }
 
 impl RoutingConfig {
-    /// Decide how to route a connection to `host:port`.
-    ///
-    /// Returns `true` if the connection should bypass the remote proxy (direct
-    /// connect). Priority (highest first):
-    /// 1. Explicit `proxy` rules  → tunnel
-    /// 2. Explicit `bypass` rules → direct
-    /// 3. GeoSite domain rules    → direct
-    /// 4. GeoIP CIDR rules        → direct (IP targets only)
-    /// 5. Default                 → tunnel
     pub fn should_bypass(&self, host: &str, port: u16) -> bool {
         let h = host.to_lowercase();
 
-        // 1. Explicit proxy rules override everything.
         if self.proxy.iter().any(|r| r.matches(&h, port)) {
             return false;
         }
-
-        // 2. Explicit bypass rules.
         if self.bypass.iter().any(|r| r.matches(&h, port)) {
             return true;
         }
-
-        // 3. GeoSite domain bypass.
         if let Some(gs) = &self.bypass_geosite
             && gs.matches(&h)
         {
             return true;
         }
-
-        // 4. CIDR bypass — only when the target is a bare IP address.
         if let Ok(ip) = h.parse::<IpAddr>()
             && self.bypass_cidrs.iter().any(|n| n.contains(&ip))
         {
             return true;
         }
-
         false
     }
 }
 
-// ── Mux / WebSocket helpers ───────────────────────────────────────────────────
+// ── TLS trust configuration ───────────────────────────────────────────────────
 
-pub fn make_shutdown_channel() -> (channel::Sender<()>, Receiver<()>) {
-    channel::bounded(1)
+/// Describes how the client should validate the server's TLS certificate.
+#[derive(Debug, Clone)]
+pub enum TlsTrustConfig {
+    /// Trust certificates from the platform's native certificate store (default).
+    NativeCerts,
+    /// Accept any certificate without validation (tests only).
+    NoCertValidation,
+    /// Accept a certificate with the given SHA-256 hash (self-signed servers).
+    CertHash(wtransport::tls::Sha256Digest),
 }
 
-fn build_request(
-    url_str: &str,
-) -> Result<Request<()>, async_tungstenite::tungstenite::http::Error> {
-    let uri = Uri::from_str(url_str).unwrap();
-    Request::builder()
-        .uri(url_str)
-        .header("Host", uri.host().unwrap())
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", generate_key())
-        .body(())
-}
-
-/// Handshake with /control. `version` defaults to the package version at compile time.
-pub async fn obtain_token(endpoint: &str, user: &str) -> Option<String> {
-    obtain_token_with_version(endpoint, user, env!("CARGO_PKG_VERSION")).await
-}
-
-/// Same as `obtain_token` but with an explicit version string (useful for testing bad versions).
-pub async fn obtain_token_with_version(
-    endpoint: &str,
-    user: &str,
-    version: &str,
-) -> Option<String> {
-    let mut base = endpoint.to_string();
-    if !base.ends_with('/') {
-        base.push('/');
-    }
-    let (mut ws, _) = connect_async(format!("{}control", base)).await.ok()?;
-
-    ws.send(Message::Text(format!("Hello:{}:{}", version, user).into()))
-        .await
-        .ok()?;
-    ws.flush().await.ok()?;
-
-    let msg = ws.next().await?.ok()?;
-    let text = msg.to_text().ok()?;
-    if let Some(token) = text.strip_prefix("Hi:") {
-        Some(token.to_string())
-    } else {
-        tracing::warn!("{}", text.strip_prefix("Bye:").unwrap_or(text));
-        None
+impl TlsTrustConfig {
+    pub fn build_client_config(&self) -> ClientConfig {
+        match self {
+            TlsTrustConfig::NativeCerts => ClientConfig::builder()
+                .with_bind_default()
+                .with_native_certs()
+                .build(),
+            TlsTrustConfig::NoCertValidation => ClientConfig::builder()
+                .with_bind_default()
+                .with_no_cert_validation()
+                .build(),
+            TlsTrustConfig::CertHash(hash) => ClientConfig::builder()
+                .with_bind_default()
+                .with_server_certificate_hashes([hash.clone()])
+                .build(),
+        }
     }
 }
 
-/// Run the local HTTP proxy. Accepts connections on `local_listener` and tunnels
-/// them through the mux connection at `endpoint` using the provided `token`.
-/// Exits when `shutdown` is closed/sent.
-pub async fn run_proxy(
-    endpoint: String,
-    local_listener: TcpListener,
-    token: String,
-    shutdown: Receiver<()>,
-) -> std::io::Result<()> {
-    run_proxy_with_routing(
-        endpoint,
-        local_listener,
-        token,
-        shutdown,
-        RoutingConfig::default(),
-    )
-    .await
+// ── Shared WebTransport connection ────────────────────────────────────────────
+
+type SharedConn = Arc<Mutex<Option<Arc<Connection>>>>;
+
+pub fn make_shutdown_channel() -> (broadcast::Sender<()>, broadcast::Receiver<()>) {
+    broadcast::channel(1)
 }
 
-/// Like [`run_proxy`] but with explicit routing rules.
-pub async fn run_proxy_with_routing(
+// ── Resilient proxy ───────────────────────────────────────────────────────────
+
+/// Run HTTP and optional SOCKS5 proxies backed by a WebTransport session that
+/// automatically reconnects when the server drops.
+pub async fn run_proxy_resilient(
     endpoint: String,
-    local_listener: TcpListener,
-    token: String,
-    shutdown: Receiver<()>,
+    user: String,
+    trust: TlsTrustConfig,
+    http_listener: TcpListener,
+    socks_listener: Option<TcpListener>,
+    mut shutdown: broadcast::Receiver<()>,
     routing: RoutingConfig,
 ) -> std::io::Result<()> {
-    let mux_url = {
-        let mut base = endpoint.clone();
-        if !base.ends_with('/') {
-            base.push('/');
-        }
-        format!("{}mux", base)
-    };
-
-    let (ws_stream, _) = connect_async(build_request(&mux_url).unwrap())
-        .await
-        .map_err(std::io::Error::other)?;
-
-    let (ws_sink, ws_src) = ws_stream.split();
-
-    // Send HELLO with token.
-    ws_sink
-        .send(Message::Binary(Frame::Hello(token).encode().into()))
-        .await
-        .map_err(std::io::Error::other)?;
-
-    let (frame_tx, frame_rx) = frame_channel(128);
-    let registry = StreamRegistry::new();
-    let pending_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
-    let next_id = Arc::new(AtomicU32::new(1));
+    let shared: SharedConn = Arc::new(Mutex::new(None));
     let routing = Arc::new(routing);
 
-    // Writer loop: frame_rx → ws sink
-    task::spawn(async move {
-        while let Ok(frame) = frame_rx.recv().await {
-            let bytes = frame.encode();
-            if ws_sink.send(Message::Binary(bytes.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Reader loop: ws → Frame → route
+    // Session keeper task
+    let (keeper_stop_tx, keeper_stop_rx) = broadcast::channel::<()>(1);
     {
-        let registry = registry.clone();
-        let pending_acks = pending_acks.clone();
-        task::spawn(async move {
-            run_client_reader(ws_src, registry, pending_acks).await;
-        });
+        let shared = shared.clone();
+        let endpoint = endpoint.clone();
+        let user = user.clone();
+        let trust = trust.clone();
+        task::spawn(run_session_keeper(
+            endpoint,
+            user,
+            trust,
+            shared,
+            keeper_stop_rx,
+        ));
     }
 
     tracing::info!(
-        addr = %local_listener.local_addr().unwrap(),
+        addr = %http_listener.local_addr().unwrap(),
         "http proxy listening"
     );
 
-    loop {
-        futures::select! {
-            result = local_listener.accept().fuse() => {
-                match result {
+    if let Some(sl) = socks_listener {
+        tracing::info!(addr = %sl.local_addr().unwrap(), "socks5 proxy listening");
+        let shared = shared.clone();
+        let routing = routing.clone();
+        task::spawn(async move {
+            loop {
+                match sl.accept().await {
                     Ok((stream, _)) => {
-                        let id = next_id.fetch_add(1, Ordering::Relaxed);
-                        let ftx = frame_tx.clone();
-                        let reg = registry.clone();
-                        let packs = pending_acks.clone();
-                        let routing = routing.clone();
-                        task::spawn(handle_local_connection(stream, id, ftx, reg, packs, routing));
+                        task::spawn(handle_socks_connection(stream, shared.clone(), routing.clone()));
                     }
-                    Err(e) => return Err(e),
+                    Err(_) => break,
                 }
             }
-            _ = shutdown.recv().fuse() => break,
+        });
+    }
+
+    loop {
+        tokio::select! {
+            result = http_listener.accept() => {
+                match result {
+                    Ok((stream, _)) => {
+                        task::spawn(handle_http_connection(stream, shared.clone(), routing.clone()));
+                    }
+                    Err(e) => {
+                        let _ = keeper_stop_tx.send(());
+                        return Err(e);
+                    }
+                }
+            }
+            _ = shutdown.recv() => {
+                let _ = keeper_stop_tx.send(());
+                break;
+            }
         }
     }
     Ok(())
 }
 
-async fn run_client_reader<S>(mut ws_src: S, registry: StreamRegistry, pending_acks: PendingAcks)
-where
-    S: futures::Stream<Item = Result<Message, async_tungstenite::tungstenite::Error>>
-        + Unpin
-        + Send
-        + 'static,
-{
-    while let Some(msg) = ws_src.next().await {
-        let data = match msg {
-            Ok(Message::Binary(d)) => d,
-            Ok(Message::Ping(_)) => continue,
-            _ => break,
-        };
-        match Frame::decode(&data) {
-            Ok(Frame::OpenAck { id, ok }) => {
-                if let Some(tx) = pending_acks.lock().unwrap().remove(&id) {
-                    let _ = tx.try_send(ok);
+async fn run_session_keeper(
+    endpoint: String,
+    user: String,
+    trust: TlsTrustConfig,
+    shared: SharedConn,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    let mut backoff = Duration::from_millis(RECONNECT_INITIAL_MS);
+    let max_backoff = Duration::from_secs(RECONNECT_MAX_SECS);
+
+    loop {
+        let conn = loop {
+            let config = trust.build_client_config();
+            match connect_and_auth(&endpoint, &user, config).await {
+                Some(c) => {
+                    backoff = Duration::from_millis(RECONNECT_INITIAL_MS);
+                    break c;
+                }
+                None => {
+                    tracing::warn!(delay = ?backoff, "session connect/auth failed, retrying");
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = shutdown.recv() => return,
+                    }
+                    backoff = (backoff * 2).min(max_backoff);
                 }
             }
-            Ok(Frame::Data { id, bytes }) => {
-                registry.route(id, bytes).await;
-            }
-            Ok(Frame::Close { id }) => {
-                registry.close(id);
-            }
-            _ => {}
+        };
+
+        tracing::info!("WebTransport session established");
+        let conn = Arc::new(conn);
+        *shared.lock().unwrap() = Some(conn.clone());
+
+        // Wait for connection to drop
+        let closed = conn.closed().await;
+        tracing::warn!("session closed ({:?}), reconnecting", closed);
+        *shared.lock().unwrap() = None;
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(RECONNECT_INITIAL_MS)) => {}
+            _ = shutdown.recv() => return,
         }
     }
-    registry.close_all();
-    // Drop all pending ack senders so waiting OPEN_ACK futures unblock immediately.
-    pending_acks.lock().unwrap().clear();
 }
 
-async fn handle_local_connection(
-    tcp_stream: TcpStream,
-    stream_id: u32,
-    frame_tx: FrameTx,
-    registry: StreamRegistry,
-    pending_acks: PendingAcks,
+/// Connect to the WebTransport endpoint and complete the auth handshake.
+/// Returns the authenticated `Connection` on success.
+pub async fn connect_and_auth(
+    endpoint: &str,
+    user: &str,
+    config: ClientConfig,
+) -> Option<Connection> {
+    let ep = Endpoint::client(config).ok()?;
+    let conn = ep.connect(endpoint).await.ok()?;
+
+    // Open the auth control stream
+    let mut ctrl = match conn.open_bi().await {
+        Ok(opening) => match opening.await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("open auth stream failed: {e}");
+                return None;
+            }
+        },
+        Err(e) => {
+            tracing::debug!("open_bi failed: {e}");
+            return None;
+        }
+    };
+
+    let msg = format!("Hello:{}:{}\n", env!("CARGO_PKG_VERSION"), user);
+    if ctrl.0.write_all(msg.as_bytes()).await.is_err() {
+        return None;
+    }
+
+    let resp = read_wt_message(&mut ctrl.1).await?;
+    if resp.starts_with("Hi") {
+        tracing::info!("auth ok");
+        Some(conn)
+    } else {
+        let reason = resp.strip_prefix("Bye:").unwrap_or(&resp);
+        tracing::warn!("{reason}");
+        None
+    }
+}
+
+/// Open a proxy stream to `dest` and get back the bidirectional stream halves.
+async fn open_proxy_stream(
+    conn: &Connection,
+    dest: &str,
+) -> Option<(wtransport::SendStream, wtransport::RecvStream)> {
+    let mut stream = match conn.open_bi().await {
+        Ok(opening) => opening.await.ok()?,
+        Err(_) => return None,
+    };
+
+    let msg = format!("{dest}\n");
+    stream.0.write_all(msg.as_bytes()).await.ok()?;
+
+    let mut status = [0u8; 1];
+    stream.1.read_exact(&mut status).await.ok()?;
+    if status[0] == 0x00 {
+        Some((stream.0, stream.1))
+    } else {
+        None
+    }
+}
+
+// ── HTTP connection handler ───────────────────────────────────────────────────
+
+async fn handle_http_connection(
+    tcp: TcpStream,
+    shared: SharedConn,
     routing: Arc<RoutingConfig>,
 ) {
-    let (host, headers, body) = match parse_request_header(tcp_stream.clone()).await {
+    let (tcp, host, headers, body) = match parse_http_request(tcp).await {
         Some(r) => r,
         None => return,
     };
     let is_connect = headers.starts_with("CONNECT ");
 
-    // Determine the bare host and port for routing.
-    let (bare_host, port) = if let Some((h, p)) = host.rsplit_once(':') {
-        let port = p.parse::<u16>().unwrap_or(80);
-        (h.to_string(), port)
-    } else {
-        (host.clone(), 80)
-    };
+    let (bare_host, port) = split_host_port(&host);
 
     if routing.should_bypass(&bare_host, port) {
         tracing::info!(host = %bare_host, port, method = if is_connect { "CONNECT" } else { "plain" }, route = "direct", "→");
-        handle_direct(tcp_stream, &host, is_connect, headers, body).await;
+        handle_direct(tcp, &host, is_connect, headers, body).await;
         return;
     }
 
     tracing::info!(host = %bare_host, port, method = if is_connect { "CONNECT" } else { "plain" }, route = "proxy", "→");
-    handle_via_mux(
-        tcp_stream,
-        MuxState {
-            stream_id,
-            frame_tx,
-            registry,
-            pending_acks,
-        },
-        ProxyRequest {
-            host,
-            is_connect,
-            headers,
-            body,
-        },
-    )
-    .await;
-}
 
-/// Forward the connection directly to the target without going through the mux.
-async fn handle_direct(
-    mut tcp_stream: TcpStream,
-    host: &str,
-    is_connect: bool,
-    headers: String,
-    body: Vec<u8>,
-) {
-    let mut upstream = match TcpStream::connect(host).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(host, "direct connect failed: {e}");
-            let _ = tcp_stream
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await;
+    let conn = {
+        let guard = shared.lock().unwrap();
+        guard.clone()
+    };
+    let conn = match conn {
+        Some(c) => c,
+        None => {
+            tracing::warn!(host = %bare_host, "mux unavailable (reconnecting), returning 502");
+            let _ = send_502(tcp).await;
             return;
         }
     };
 
+    let result = tokio::time::timeout(
+        Duration::from_secs(OPEN_ACK_TIMEOUT_SECS),
+        open_proxy_stream(&conn, &host),
+    )
+    .await;
+
+    let (wt_send, wt_recv) = match result {
+        Ok(Some(s)) => s,
+        _ => {
+            tracing::warn!(host = %bare_host, "proxy stream open failed");
+            let _ = send_502(tcp).await;
+            return;
+        }
+    };
+
+    finish_http_relay(tcp, wt_send, wt_recv, is_connect, headers, body).await;
+}
+
+async fn finish_http_relay(
+    mut tcp: TcpStream,
+    wt_send: wtransport::SendStream,
+    wt_recv: wtransport::RecvStream,
+    is_connect: bool,
+    headers: String,
+    body: Vec<u8>,
+) {
     if is_connect {
-        if tcp_stream
+        if tcp
             .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
             .await
             .is_err()
@@ -411,18 +405,122 @@ async fn handle_direct(
     } else {
         let mut data = headers.into_bytes();
         data.extend_from_slice(&body);
-        if upstream.write_all(&data).await.is_err() {
+        // Forward initial HTTP request through the proxy stream
+        relay_wt_stream(tcp, wt_send, wt_recv, Some(data)).await;
+        return;
+    }
+    relay_wt_stream(tcp, wt_send, wt_recv, None).await;
+}
+
+// ── SOCKS5 connection handler ─────────────────────────────────────────────────
+
+async fn handle_socks_connection(
+    mut tcp: TcpStream,
+    shared: SharedConn,
+    routing: Arc<RoutingConfig>,
+) {
+    let host = match parse_socks5_request(&mut tcp).await {
+        Some(h) => h,
+        None => return,
+    };
+
+    let (bare_host, port) = split_host_port(&host);
+
+    if routing.should_bypass(&bare_host, port) {
+        tracing::info!(host = %bare_host, port, route = "direct", "→ socks5");
+        handle_socks_direct(tcp, &host).await;
+        return;
+    }
+
+    tracing::info!(host = %bare_host, port, route = "proxy", "→ socks5");
+
+    let conn = {
+        let guard = shared.lock().unwrap();
+        guard.clone()
+    };
+    let conn = match conn {
+        Some(c) => c,
+        None => {
+            let _ = tcp.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
+            return;
+        }
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(OPEN_ACK_TIMEOUT_SECS),
+        open_proxy_stream(&conn, &host),
+    )
+    .await;
+
+    let (wt_send, wt_recv) = match result {
+        Ok(Some(s)) => s,
+        _ => {
+            let _ = tcp.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
+            return;
+        }
+    };
+
+    if tcp
+        .write_all(&socks5_reply(SOCKS5_REP_SUCCESS))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    relay_wt_stream(tcp, wt_send, wt_recv, None).await;
+}
+
+// ── Relay helpers ─────────────────────────────────────────────────────────────
+
+/// Relay bytes between a local TCP stream and a WebTransport bidirectional stream.
+/// `initial_data` is forwarded into the WT send stream before the relay loop starts.
+async fn relay_wt_stream(
+    tcp: TcpStream,
+    mut wt_send: wtransport::SendStream,
+    mut wt_recv: wtransport::RecvStream,
+    initial_data: Option<Vec<u8>>,
+) {
+    if let Some(data) = initial_data {
+        if wt_send.write_all(&data).await.is_err() {
             return;
         }
     }
 
-    relay_tcp(tcp_stream, upstream).await;
+    let (mut tcp_recv, mut tcp_send) = tcp.into_split();
+
+    let wt_to_tcp = task::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match wt_recv.read(&mut buf).await {
+                Ok(Some(0)) | Ok(None) | Err(_) => break,
+                Ok(Some(n)) => {
+                    if tcp_send.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match tcp_recv.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if wt_send.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    drop(wt_to_tcp);
 }
 
-/// Relay bytes bidirectionally between two TCP streams until either side closes.
+/// Relay bytes between two TCP streams until either side closes.
 async fn relay_tcp(a: TcpStream, b: TcpStream) {
-    let (mut ar, mut aw) = a.split();
-    let (mut br, mut bw) = b.split();
+    let (mut ar, mut aw) = a.into_split();
+    let (mut br, mut bw) = b.into_split();
 
     let a_to_b = task::spawn(async move {
         let mut buf = vec![0u8; 8192];
@@ -449,373 +547,64 @@ async fn relay_tcp(a: TcpStream, b: TcpStream) {
             }
         }
     }
-
     drop(a_to_b);
 }
 
-/// Shared mux relay: pump data between `tcp_stream` and the mux `data_rx`/`frame_tx`.
-/// Called after OPEN_ACK succeeds and any protocol-specific success response has been sent.
-async fn do_mux_relay(
-    tcp_stream: TcpStream,
-    stream_id: u32,
-    conn: Arc<MuxConn>,
-    data_rx: DataRx,
-) {
-    let frame_tx = conn.frame_tx.clone();
-    let (mut tcp_reader, mut tcp_writer) = tcp_stream.split();
-
-    let write_task = task::spawn(async move {
-        while let Ok(data) = data_rx.recv().await {
-            if tcp_writer.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let mut buf = vec![0u8; 8192];
-    loop {
-        match tcp_reader.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if frame_tx
-                    .send(Frame::Data {
-                        id: stream_id,
-                        bytes: buf[..n].to_vec(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }
-    }
-    let _ = conn.frame_tx.send(Frame::Close { id: stream_id }).await;
-    conn.registry.close(stream_id);
-    drop(write_task);
-}
-
-// ── SOCKS5 helpers ────────────────────────────────────────────────────────────
-
-/// Build a minimal SOCKS5 reply: VER(5) REP ATYP=IPv4 BND=0.0.0.0:0
-fn socks5_reply(rep: u8) -> [u8; 10] {
-    [SOCKS5_VERSION, rep, 0x00, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0, 0]
-}
-
-/// Parse a SOCKS5 greeting + CONNECT request from `stream`.
-///
-/// Handles method negotiation (only NO_AUTH accepted) and returns the target
-/// address as a `"host:port"` string, or `None` on any protocol error.
-/// IPv6 addresses are returned in bracket notation `"[::1]:port"`.
-/// No SOCKS5 success/failure reply is sent here; that is left to the caller.
-async fn parse_socks5_request(stream: &mut TcpStream) -> Option<String> {
-    // --- Greeting ---
-    let mut hdr = [0u8; 2];
-    stream.read_exact(&mut hdr).await.ok()?;
-    if hdr[0] != SOCKS5_VERSION {
-        return None;
-    }
-    let nmethods = hdr[1] as usize;
-    let mut methods = vec![0u8; nmethods];
-    stream.read_exact(&mut methods).await.ok()?;
-
-    if methods.contains(&SOCKS5_AUTH_NO_AUTH) {
-        stream
-            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NO_AUTH])
-            .await
-            .ok()?;
-    } else {
-        let _ = stream
-            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NO_ACCEPTABLE])
-            .await;
-        return None;
-    }
-
-    // --- Request ---
-    let mut req = [0u8; 4]; // VER CMD RSV ATYP
-    stream.read_exact(&mut req).await.ok()?;
-    if req[0] != SOCKS5_VERSION {
-        return None;
-    }
-    let cmd = req[1];
-    let atyp = req[3];
-
-    if cmd != SOCKS5_CMD_CONNECT {
-        let _ = stream.write_all(&socks5_reply(SOCKS5_REP_CMD_NOT_SUPPORTED)).await;
-        return None;
-    }
-
-    let host = match atyp {
-        SOCKS5_ATYP_IPV4 => {
-            let mut addr = [0u8; 4];
-            stream.read_exact(&mut addr).await.ok()?;
-            std::net::Ipv4Addr::from(addr).to_string()
-        }
-        SOCKS5_ATYP_IPV6 => {
-            let mut addr = [0u8; 16];
-            stream.read_exact(&mut addr).await.ok()?;
-            format!("[{}]", std::net::Ipv6Addr::from(addr))
-        }
-        SOCKS5_ATYP_DOMAIN => {
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await.ok()?;
-            let mut domain = vec![0u8; len[0] as usize];
-            stream.read_exact(&mut domain).await.ok()?;
-            String::from_utf8(domain).ok()?
-        }
-        _ => {
-            let _ = stream.write_all(&socks5_reply(SOCKS5_REP_ATYP_NOT_SUPPORTED)).await;
-            return None;
-        }
-    };
-
-    let mut port_bytes = [0u8; 2];
-    stream.read_exact(&mut port_bytes).await.ok()?;
-    let port = u16::from_be_bytes(port_bytes);
-
-    Some(format!("{}:{}", host, port))
-}
-
-/// Split a `host:port` string and return `(bare_host, port)`.
-/// Strips IPv6 brackets for routing checks: `"[::1]:443"` → `("::1", 443)`.
-fn split_host_port(addr: &str) -> (String, u16) {
-    if let Some((h, p)) = addr.rsplit_once(':') {
-        let port = p.parse::<u16>().unwrap_or(80);
-        let bare = h.trim_matches(|c| c == '[' || c == ']').to_string();
-        (bare, port)
-    } else {
-        (addr.to_string(), 80)
-    }
-}
-
-/// Handle a SOCKS5 connection by connecting directly to the target (bypass path).
-async fn handle_socks_direct(mut tcp_stream: TcpStream, host: &str) {
-    let upstream = match TcpStream::connect(host).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(host, "socks5 direct connect failed: {e}");
-            let _ = tcp_stream.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
-            return;
-        }
-    };
-    let _ = tcp_stream.write_all(&socks5_reply(SOCKS5_REP_SUCCESS)).await;
-    relay_tcp(tcp_stream, upstream).await;
-}
-
-/// Handle a SOCKS5 connection through the mux tunnel (with OPEN_ACK timeout).
-async fn handle_socks_via_mux_with_timeout(
-    mut tcp_stream: TcpStream,
-    stream_id: u32,
-    conn: Arc<MuxConn>,
-    host: String,
-) {
-    use async_std::future::timeout;
-
-    let data_rx = conn.registry.register(stream_id);
-    let (ack_tx, ack_rx) = channel::bounded::<bool>(1);
-    conn.pending_acks.lock().unwrap().insert(stream_id, ack_tx);
-
-    if conn
-        .frame_tx
-        .send(Frame::Open {
-            id: stream_id,
-            dest: host,
-        })
-        .await
-        .is_err()
-    {
-        conn.registry.close(stream_id);
-        let _ = tcp_stream.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
-        return;
-    }
-
-    let ok = match timeout(Duration::from_secs(OPEN_ACK_TIMEOUT_SECS), ack_rx.recv()).await {
-        Ok(Ok(v)) => v,
-        _ => false,
-    };
-
-    if !ok {
-        tracing::warn!(stream_id, "socks5 OPEN_ACK failed or timed out");
-        conn.registry.close(stream_id);
-        let _ = tcp_stream.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
-        return;
-    }
-
-    if tcp_stream
-        .write_all(&socks5_reply(SOCKS5_REP_SUCCESS))
-        .await
-        .is_err()
-    {
-        conn.registry.close(stream_id);
-        return;
-    }
-
-    do_mux_relay(tcp_stream, stream_id, conn, data_rx).await;
-}
-
-/// Accept and handle one incoming SOCKS5 connection in resilient mode.
-async fn handle_socks_connection_resilient(
-    mut tcp_stream: TcpStream,
-    stream_id: u32,
-    shared_mux: SharedMux,
-    routing: Arc<RoutingConfig>,
-) {
-    let host = match parse_socks5_request(&mut tcp_stream).await {
-        Some(h) => h,
-        None => return,
-    };
-
-    let (bare_host, port) = split_host_port(&host);
-
-    if routing.should_bypass(&bare_host, port) {
-        tracing::info!(host = %bare_host, port, route = "direct", "→ socks5");
-        handle_socks_direct(tcp_stream, &host).await;
-        return;
-    }
-
-    tracing::info!(host = %bare_host, port, route = "proxy", "→ socks5");
-
-    let conn = shared_mux.lock().unwrap().clone();
-    let conn = match conn {
-        Some(c) => c,
-        None => {
-            tracing::warn!(host = %bare_host, "mux unavailable (reconnecting), socks5 returning failure");
-            let _ = tcp_stream.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
-            return;
-        }
-    };
-
-    handle_socks_via_mux_with_timeout(tcp_stream, stream_id, conn, host).await;
-}
-
-struct MuxState {
-    stream_id: u32,
-    frame_tx: FrameTx,
-    registry: StreamRegistry,
-    pending_acks: PendingAcks,
-}
-
-struct ProxyRequest {
-    host: String,
+async fn handle_direct(
+    mut tcp: TcpStream,
+    host: &str,
     is_connect: bool,
     headers: String,
     body: Vec<u8>,
-}
-
-/// Forward the connection through the mux WebSocket tunnel.
-async fn handle_via_mux(tcp_stream: TcpStream, state: MuxState, request: ProxyRequest) {
-    let MuxState {
-        stream_id,
-        frame_tx,
-        registry,
-        pending_acks,
-    } = state;
-    let ProxyRequest {
-        host,
-        is_connect,
-        headers,
-        body,
-    } = request;
-
-    // Register the stream BEFORE sending OPEN to avoid a DATA routing race.
-    let data_rx = registry.register(stream_id);
-
-    // Register a one-shot for OPEN_ACK.
-    let (ack_tx, ack_rx) = channel::bounded::<bool>(1);
-    pending_acks.lock().unwrap().insert(stream_id, ack_tx);
-
-    if frame_tx
-        .send(Frame::Open {
-            id: stream_id,
-            dest: host,
-        })
-        .await
-        .is_err()
-    {
-        registry.close(stream_id);
-        return;
-    }
-
-    let ok = ack_rx.recv().await.unwrap_or(false);
-    if !ok {
-        tracing::warn!(stream_id, "mux OPEN_ACK failed, closing stream");
-        registry.close(stream_id);
-        let _ = tcp_stream
-            .clone()
-            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-            .await;
-        return;
-    }
-
-    let mut tcp_stream = tcp_stream;
+) {
+    let mut upstream = match TcpStream::connect(host).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(host, "direct connect failed: {e}");
+            let _ = send_502(tcp).await;
+            return;
+        }
+    };
 
     if is_connect {
-        if tcp_stream
+        if tcp
             .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
             .await
             .is_err()
         {
-            registry.close(stream_id);
             return;
         }
     } else {
-        let mut request_data = headers.into_bytes();
-        request_data.extend_from_slice(&body);
-        if frame_tx
-            .send(Frame::Data {
-                id: stream_id,
-                bytes: request_data,
-            })
-            .await
-            .is_err()
-        {
-            registry.close(stream_id);
+        let mut data = headers.into_bytes();
+        data.extend_from_slice(&body);
+        if upstream.write_all(&data).await.is_err() {
             return;
         }
     }
 
-    let (mut tcp_reader, mut tcp_writer) = tcp_stream.split();
-
-    // ws DATA → tcp write
-    let write_task = task::spawn(async move {
-        while let Ok(data) = data_rx.recv().await {
-            if tcp_writer.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // tcp read → ws DATA
-    let mut buf = vec![0u8; 8192];
-    loop {
-        match tcp_reader.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if frame_tx
-                    .send(Frame::Data {
-                        id: stream_id,
-                        bytes: buf[..n].to_vec(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }
-    }
-    let _ = frame_tx.send(Frame::Close { id: stream_id }).await;
-    registry.close(stream_id);
-    drop(write_task);
+    relay_tcp(tcp, upstream).await;
 }
 
-/// Read HTTP request headers and optional body from a cloned TcpStream.
-/// Returns None on malformed input or if limits are exceeded.
-async fn parse_request_header(tcp_stream: TcpStream) -> Option<(String, String, Vec<u8>)> {
+async fn handle_socks_direct(mut tcp: TcpStream, host: &str) {
+    let upstream = match TcpStream::connect(host).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(host, "socks5 direct connect failed: {e}");
+            let _ = tcp.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
+            return;
+        }
+    };
+    let _ = tcp.write_all(&socks5_reply(SOCKS5_REP_SUCCESS)).await;
+    relay_tcp(tcp, upstream).await;
+}
+
+// ── HTTP request parsing ──────────────────────────────────────────────────────
+
+async fn parse_http_request(tcp: TcpStream) -> Option<(TcpStream, String, String, Vec<u8>)> {
     let mut headers = String::new();
     let mut host = String::new();
     let mut content_length: usize = 0;
-    let mut reader = BufReader::new(tcp_stream);
+    let mut reader = BufReader::new(tcp);
 
     loop {
         let mut line = String::new();
@@ -860,361 +649,126 @@ async fn parse_request_header(tcp_stream: TcpStream) -> Option<(String, String, 
         reader.read_exact(&mut body).await.ok()?;
     }
 
-    Some((host, headers, body))
+    let tcp = reader.into_inner();
+    Some((tcp, host, headers, body))
 }
 
-// ── Resilient proxy (mux auto-reconnect) ─────────────────────────────────────
+// ── SOCKS5 helpers ────────────────────────────────────────────────────────────
 
-const OPEN_ACK_TIMEOUT_SECS: u64 = 10;
-const RECONNECT_INITIAL_MS: u64 = 500;
-const RECONNECT_MAX_SECS: u64 = 30;
-
-struct MuxConn {
-    frame_tx: FrameTx,
-    registry: StreamRegistry,
-    pending_acks: PendingAcks,
+fn socks5_reply(rep: u8) -> [u8; 10] {
+    [SOCKS5_VERSION, rep, 0x00, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0, 0]
 }
 
-impl MuxConn {
-    /// Drop all pending ack senders and close all streams so in-flight requests
-    /// unblock immediately instead of waiting for the OPEN_ACK timeout.
-    fn close(&self) {
-        self.pending_acks.lock().unwrap().clear();
-        self.registry.close_all();
+async fn parse_socks5_request(stream: &mut TcpStream) -> Option<String> {
+    let mut hdr = [0u8; 2];
+    stream.read_exact(&mut hdr).await.ok()?;
+    if hdr[0] != SOCKS5_VERSION {
+        return None;
+    }
+    let nmethods = hdr[1] as usize;
+    let mut methods = vec![0u8; nmethods];
+    stream.read_exact(&mut methods).await.ok()?;
+
+    if methods.contains(&SOCKS5_AUTH_NO_AUTH) {
+        stream
+            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NO_AUTH])
+            .await
+            .ok()?;
+    } else {
+        let _ = stream
+            .write_all(&[SOCKS5_VERSION, SOCKS5_AUTH_NO_ACCEPTABLE])
+            .await;
+        return None;
+    }
+
+    let mut req = [0u8; 4];
+    stream.read_exact(&mut req).await.ok()?;
+    if req[0] != SOCKS5_VERSION {
+        return None;
+    }
+    let cmd = req[1];
+    let atyp = req[3];
+
+    if cmd != SOCKS5_CMD_CONNECT {
+        let _ = stream.write_all(&socks5_reply(SOCKS5_REP_CMD_NOT_SUPPORTED)).await;
+        return None;
+    }
+
+    let host = match atyp {
+        SOCKS5_ATYP_IPV4 => {
+            let mut addr = [0u8; 4];
+            stream.read_exact(&mut addr).await.ok()?;
+            std::net::Ipv4Addr::from(addr).to_string()
+        }
+        SOCKS5_ATYP_IPV6 => {
+            let mut addr = [0u8; 16];
+            stream.read_exact(&mut addr).await.ok()?;
+            format!("[{}]", std::net::Ipv6Addr::from(addr))
+        }
+        SOCKS5_ATYP_DOMAIN => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await.ok()?;
+            let mut domain = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut domain).await.ok()?;
+            String::from_utf8(domain).ok()?
+        }
+        _ => {
+            let _ = stream
+                .write_all(&socks5_reply(SOCKS5_REP_ATYP_NOT_SUPPORTED))
+                .await;
+            return None;
+        }
+    };
+
+    let mut port_bytes = [0u8; 2];
+    stream.read_exact(&mut port_bytes).await.ok()?;
+    let port = u16::from_be_bytes(port_bytes);
+
+    Some(format!("{}:{}", host, port))
+}
+
+fn split_host_port(addr: &str) -> (String, u16) {
+    if let Some((h, p)) = addr.rsplit_once(':') {
+        let port = p.parse::<u16>().unwrap_or(80);
+        let bare = h.trim_matches(|c| c == '[' || c == ']').to_string();
+        (bare, port)
+    } else {
+        (addr.to_string(), 80)
     }
 }
 
-type SharedMux = Arc<Mutex<Option<Arc<MuxConn>>>>;
+async fn send_502(mut tcp: TcpStream) -> std::io::Result<()> {
+    tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        .await
+}
 
-/// Like [`run_proxy_with_routing`] but reconnects the remote WebSocket
-/// automatically when the connection drops (Nginx restart, idle timeout, etc.).
-///
-/// Token acquisition and re-authentication are handled internally; the caller
-/// only needs to supply the `user` identifier used for `/control`.
-///
-/// If `socks_listener` is provided, a SOCKS5 proxy is also started on that
-/// listener, sharing the same mux connection as the HTTP proxy.
-pub async fn run_proxy_resilient(
-    endpoint: String,
-    user: String,
-    http_listener: TcpListener,
-    socks_listener: Option<TcpListener>,
-    shutdown: Receiver<()>,
-    routing: RoutingConfig,
-) -> std::io::Result<()> {
-    let shared: SharedMux = Arc::new(Mutex::new(None));
-    let next_id = Arc::new(AtomicU32::new(1));
-    let routing = Arc::new(routing);
+// ── WebTransport message helper ───────────────────────────────────────────────
 
-    // Keeper task: maintains the /mux WebSocket and reconnects when it drops.
-    let (keeper_stop_tx, keeper_stop_rx) = channel::bounded::<()>(1);
-    {
-        let shared = shared.clone();
-        let endpoint = endpoint.clone();
-        task::spawn(async move {
-            run_mux_keeper(endpoint, user, shared, keeper_stop_rx).await;
-        });
-    }
-
-    tracing::info!(
-        addr = %http_listener.local_addr().unwrap(),
-        "http proxy listening"
-    );
-
-    // SOCKS5 listener task (shared mux, same next_id space).
-    if let Some(sl) = socks_listener {
-        tracing::info!(addr = %sl.local_addr().unwrap(), "socks5 proxy listening");
-        let shared = shared.clone();
-        let routing = routing.clone();
-        let next_id = next_id.clone();
-        task::spawn(async move {
-            loop {
-                match sl.accept().await {
-                    Ok((stream, _)) => {
-                        let id = next_id.fetch_add(1, Ordering::Relaxed);
-                        task::spawn(handle_socks_connection_resilient(
-                            stream,
-                            id,
-                            shared.clone(),
-                            routing.clone(),
-                        ));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-
+/// Read a short newline- or EOF-terminated message from a WebTransport recv stream.
+async fn read_wt_message(recv: &mut wtransport::RecvStream) -> Option<String> {
+    let mut buf = Vec::with_capacity(256);
+    let mut tmp = [0u8; 1];
     loop {
-        futures::select! {
-            result = http_listener.accept().fuse() => {
-                match result {
-                    Ok((stream, _)) => {
-                        let id = next_id.fetch_add(1, Ordering::Relaxed);
-                        let shared = shared.clone();
-                        let routing = routing.clone();
-                        task::spawn(handle_local_connection_resilient(
-                            stream, id, shared, routing,
-                        ));
-                    }
-                    Err(e) => {
-                        let _ = keeper_stop_tx.try_send(());
-                        return Err(e);
-                    }
+        match recv.read(&mut tmp).await {
+            Ok(Some(1)) => {
+                if tmp[0] == b'\n' {
+                    break;
+                }
+                buf.push(tmp[0]);
+                if buf.len() > 1024 {
+                    return None;
                 }
             }
-            _ = shutdown.recv().fuse() => {
-                let _ = keeper_stop_tx.try_send(());
+            Ok(_) => {
+                if buf.is_empty() {
+                    return None;
+                }
                 break;
             }
+            Err(_) => return None,
         }
     }
-    Ok(())
-}
-
-async fn run_mux_keeper(endpoint: String, user: String, shared: SharedMux, shutdown: Receiver<()>) {
-    let mut backoff = Duration::from_millis(RECONNECT_INITIAL_MS);
-    let max_backoff = Duration::from_secs(RECONNECT_MAX_SECS);
-
-    loop {
-        // Obtain a session token; retry with exponential backoff on failure.
-        let token = loop {
-            match obtain_token(&endpoint, &user).await {
-                Some(t) => {
-                    backoff = Duration::from_millis(RECONNECT_INITIAL_MS);
-                    break t;
-                }
-                None => {
-                    tracing::warn!(delay = ?backoff, "control handshake failed, retrying");
-                    futures::select! {
-                        _ = task::sleep(backoff).fuse() => {}
-                        _ = shutdown.recv().fuse() => return,
-                    }
-                    backoff = (backoff * 2).min(max_backoff);
-                }
-            }
-        };
-
-        // Connect to the /mux endpoint.
-        let mux_url = {
-            let mut base = endpoint.clone();
-            if !base.ends_with('/') {
-                base.push('/');
-            }
-            format!("{}mux", base)
-        };
-
-        let ws_stream = match connect_async(build_request(&mux_url).unwrap()).await {
-            Ok((s, _)) => s,
-            Err(e) => {
-                tracing::warn!(delay = ?backoff, "mux connect failed: {e}, retrying");
-                futures::select! {
-                    _ = task::sleep(backoff).fuse() => {}
-                    _ = shutdown.recv().fuse() => return,
-                }
-                backoff = (backoff * 2).min(max_backoff);
-                continue;
-            }
-        };
-
-        let (ws_sink, ws_src) = ws_stream.split();
-
-        if ws_sink
-            .send(Message::Binary(Frame::Hello(token).encode().into()))
-            .await
-            .is_err()
-        {
-            tracing::warn!("mux HELLO send failed, retrying");
-            continue;
-        }
-
-        backoff = Duration::from_millis(RECONNECT_INITIAL_MS);
-
-        let (frame_tx, frame_rx) = frame_channel(128);
-        let registry = StreamRegistry::new();
-        let pending_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
-
-        // Publish the new connection so request handlers can use it.
-        *shared.lock().unwrap() = Some(Arc::new(MuxConn {
-            frame_tx,
-            registry: registry.clone(),
-            pending_acks: pending_acks.clone(),
-        }));
-        tracing::info!("mux session established");
-
-        // Each task sends () when it exits; the first signal wakes the keeper.
-        let (disc_tx, disc_rx) = channel::bounded::<()>(2);
-
-        // Writer loop: frame_rx → ws sink.
-        {
-            let disc_tx = disc_tx.clone();
-            let reg = registry.clone();
-            task::spawn(async move {
-                while let Ok(frame) = frame_rx.recv().await {
-                    let bytes = frame.encode();
-                    if ws_sink.send(Message::Binary(bytes.into())).await.is_err() {
-                        break;
-                    }
-                }
-                reg.close_all();
-                let _ = disc_tx.try_send(());
-            });
-        }
-
-        // Reader loop: ws → Frame → dispatch.
-        {
-            let disc_tx = disc_tx.clone();
-            task::spawn(async move {
-                run_client_reader(ws_src, registry, pending_acks).await;
-                let _ = disc_tx.try_send(());
-            });
-        }
-
-        // Wait for a disconnect signal or a graceful shutdown request.
-        futures::select! {
-            _ = disc_rx.recv().fuse() => {
-                tracing::warn!("mux disconnected, will reconnect");
-                if let Some(c) = shared.lock().unwrap().take() {
-                    c.close();
-                }
-            }
-            _ = shutdown.recv().fuse() => {
-                if let Some(c) = shared.lock().unwrap().take() {
-                    c.close();
-                }
-                return;
-            }
-        }
-    }
-}
-
-async fn handle_local_connection_resilient(
-    tcp_stream: TcpStream,
-    stream_id: u32,
-    shared_mux: SharedMux,
-    routing: Arc<RoutingConfig>,
-) {
-    let (host, headers, body) = match parse_request_header(tcp_stream.clone()).await {
-        Some(r) => r,
-        None => return,
-    };
-    let is_connect = headers.starts_with("CONNECT ");
-
-    let (bare_host, port) = if let Some((h, p)) = host.rsplit_once(':') {
-        let port = p.parse::<u16>().unwrap_or(80);
-        (h.to_string(), port)
-    } else {
-        (host.clone(), 80)
-    };
-
-    if routing.should_bypass(&bare_host, port) {
-        tracing::info!(
-            host = %bare_host, port,
-            method = if is_connect { "CONNECT" } else { "plain" },
-            route = "direct", "→"
-        );
-        handle_direct(tcp_stream, &host, is_connect, headers, body).await;
-        return;
-    }
-
-    tracing::info!(
-        host = %bare_host, port,
-        method = if is_connect { "CONNECT" } else { "plain" },
-        route = "proxy", "→"
-    );
-
-    // Snapshot the current mux connection; return 502 immediately if unavailable.
-    let conn = shared_mux.lock().unwrap().clone();
-    let conn = match conn {
-        Some(c) => c,
-        None => {
-            tracing::warn!(host = %bare_host, "mux unavailable (reconnecting), returning 502");
-            let _ = tcp_stream
-                .clone()
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await;
-            return;
-        }
-    };
-
-    handle_via_mux_with_timeout(tcp_stream, stream_id, conn, host, is_connect, headers, body).await;
-}
-
-/// Like [`handle_via_mux`] but takes an [`Arc<MuxConn>`] snapshot and enforces
-/// an [`OPEN_ACK_TIMEOUT_SECS`] deadline so the browser never hangs indefinitely
-/// when the tunnel is dead.
-async fn handle_via_mux_with_timeout(
-    tcp_stream: TcpStream,
-    stream_id: u32,
-    conn: Arc<MuxConn>,
-    host: String,
-    is_connect: bool,
-    headers: String,
-    body: Vec<u8>,
-) {
-    use async_std::future::timeout;
-
-    let data_rx = conn.registry.register(stream_id);
-    let (ack_tx, ack_rx) = channel::bounded::<bool>(1);
-    conn.pending_acks.lock().unwrap().insert(stream_id, ack_tx);
-
-    if conn
-        .frame_tx
-        .send(Frame::Open {
-            id: stream_id,
-            dest: host,
-        })
-        .await
-        .is_err()
-    {
-        conn.registry.close(stream_id);
-        return;
-    }
-
-    let ok = match timeout(Duration::from_secs(OPEN_ACK_TIMEOUT_SECS), ack_rx.recv()).await {
-        Ok(Ok(v)) => v,
-        _ => false,
-    };
-
-    if !ok {
-        tracing::warn!(stream_id, "OPEN_ACK failed or timed out, returning 502");
-        conn.registry.close(stream_id);
-        let _ = tcp_stream
-            .clone()
-            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-            .await;
-        return;
-    }
-
-    let mut tcp_stream = tcp_stream;
-
-    if is_connect {
-        if tcp_stream
-            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            .await
-            .is_err()
-        {
-            conn.registry.close(stream_id);
-            return;
-        }
-    } else {
-        let mut request_data = headers.into_bytes();
-        request_data.extend_from_slice(&body);
-        if conn
-            .frame_tx
-            .send(Frame::Data {
-                id: stream_id,
-                bytes: request_data,
-            })
-            .await
-            .is_err()
-        {
-            conn.registry.close(stream_id);
-            return;
-        }
-    }
-
-    do_mux_relay(tcp_stream, stream_id, conn, data_rx).await;
+    String::from_utf8(buf).ok()
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -1259,96 +813,22 @@ mod tests {
     }
 
     #[test]
-    fn bypass_host_rule() {
-        let cfg = config(&[], &["localhost", "127.0.0.1"]);
-        assert!(cfg.should_bypass("localhost", 80));
-        assert!(cfg.should_bypass("127.0.0.1", 80));
-        assert!(!cfg.should_bypass("example.com", 80));
+    fn bypass_rule() {
+        let cfg = config(&[], &["example.com"]);
+        assert!(cfg.should_bypass("example.com", 80));
+        assert!(!cfg.should_bypass("other.com", 80));
     }
 
     #[test]
     fn cidr_bypass() {
         use std::str::FromStr;
-        let mut cfg = config(&[], &[]);
-        cfg.bypass_cidrs
-            .push(IpNet::from_str("192.168.0.0/16").unwrap());
-        assert!(cfg.should_bypass("192.168.1.1", 80));
-        assert!(!cfg.should_bypass("1.2.3.4", 80));
-    }
-
-    #[test]
-    fn proxy_overrides_cidr() {
-        use std::str::FromStr;
-        let mut cfg = config(&["192.168.1.1"], &[]);
-        cfg.bypass_cidrs
-            .push(IpNet::from_str("192.168.0.0/16").unwrap());
-        assert!(!cfg.should_bypass("192.168.1.1", 80));
-    }
-
-    #[test]
-    fn default_routing_proxies_everything() {
-        let cfg = RoutingConfig::default();
-        assert!(!cfg.should_bypass("example.com", 443));
-        assert!(!cfg.should_bypass("1.2.3.4", 80));
-    }
-
-    fn geosite_config(domains: &[&str]) -> RoutingConfig {
-        use crate::geosite::GeoSiteMatcher;
-        RoutingConfig {
+        let cfg = RoutingConfig {
             proxy: vec![],
             bypass: vec![],
-            bypass_geosite: Some(GeoSiteMatcher {
-                domains: domains.iter().map(|s| format!(".{s}")).collect(),
-                fulls: vec![],
-                keywords: vec![],
-                regexes: vec![],
-            }),
-            bypass_cidrs: vec![],
-        }
-    }
-
-    #[test]
-    fn geosite_domain_bypassed() {
-        let cfg = geosite_config(&["baidu.com", "alicdn.com"]);
-        assert!(cfg.should_bypass("baidu.com", 443));
-        assert!(cfg.should_bypass("www.baidu.com", 443));
-        assert!(cfg.should_bypass("g.alicdn.com", 443));
-        assert!(!cfg.should_bypass("google.com", 443));
-    }
-
-    #[test]
-    fn proxy_rule_overrides_geosite() {
-        use crate::geosite::GeoSiteMatcher;
-        // Exact-host proxy rule overrides geosite for that exact host only.
-        let cfg = RoutingConfig {
-            proxy: vec![pat("baidu.com")],
-            bypass: vec![],
-            bypass_geosite: Some(GeoSiteMatcher {
-                domains: vec![".baidu.com".to_string()],
-                fulls: vec![],
-                keywords: vec![],
-                regexes: vec![],
-            }),
-            bypass_cidrs: vec![],
+            bypass_geosite: None,
+            bypass_cidrs: vec![IpNet::from_str("10.0.0.0/8").unwrap()],
         };
-        // Exact match: proxy wins.
-        assert!(!cfg.should_bypass("baidu.com", 443));
-        // Subdomain: no proxy rule covers it, geosite wins.
-        assert!(cfg.should_bypass("www.baidu.com", 443));
-
-        // Wildcard proxy rule covers all subdomains.
-        let cfg2 = RoutingConfig {
-            proxy: vec![pat("baidu.com"), pat("*.baidu.com")],
-            bypass: vec![],
-            bypass_geosite: Some(GeoSiteMatcher {
-                domains: vec![".baidu.com".to_string()],
-                fulls: vec![],
-                keywords: vec![],
-                regexes: vec![],
-            }),
-            bypass_cidrs: vec![],
-        };
-        assert!(!cfg2.should_bypass("baidu.com", 443));
-        assert!(!cfg2.should_bypass("www.baidu.com", 443));
+        assert!(cfg.should_bypass("10.1.2.3", 80));
+        assert!(!cfg.should_bypass("8.8.8.8", 80));
     }
 }

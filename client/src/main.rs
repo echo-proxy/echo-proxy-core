@@ -1,12 +1,11 @@
-use async_std::net::TcpListener;
-use async_std::task;
-use clap::Parser;
 use client::{
-    RoutingConfig, geoip::load_geoip_dat, geosite::load_geosite_dat, make_shutdown_channel,
-    run_proxy_resilient,
+    RoutingConfig, TlsTrustConfig, geoip::load_geoip_dat, geosite::load_geosite_dat,
+    make_shutdown_channel, run_proxy_resilient,
 };
+use clap::Parser;
 use serde::Deserialize;
 use std::path::Path;
+use tokio::net::TcpListener;
 use tracing_subscriber::{EnvFilter, fmt};
 
 const DEFAULT_GEOIP_DAT: &str = "geoip-only-cn-private.dat";
@@ -18,23 +17,16 @@ struct ClientSection {
     user: Option<String>,
     host: Option<String>,
     port: Option<u16>,
-    /// Local address for the SOCKS5 listener (defaults to `host`).
     socks_host: Option<String>,
-    /// Local port for the SOCKS5 listener. SOCKS5 is disabled when unset.
     socks_port: Option<u16>,
-    /// Patterns that must always tunnel through the remote proxy.
     proxy: Option<Vec<String>>,
-    /// Patterns that must always connect directly.
     bypass: Option<Vec<String>>,
-    /// Path to a V2Ray `geoip.dat` file for CIDR-based bypass.
     bypass_geoip_dat: Option<String>,
-    /// Tags to extract from the geoip dat (default: ["cn", "private"]).
     bypass_geoip_tags: Option<Vec<String>>,
-    /// Path to a V2Ray GeoSite dat file for domain-based bypass.
     bypass_geosite_dat: Option<String>,
-    /// Tags to extract from the geosite dat (default: ["cn", "private"]).
     bypass_geosite_tags: Option<Vec<String>>,
-    /// Log level: off, error, warn, info, debug, trace (default: info)
+    /// SHA-256 hex digest of server certificate for self-signed cert trust.
+    cert_hash: Option<String>,
     log_level: Option<String>,
 }
 
@@ -46,29 +38,23 @@ struct FileConfig {
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Path to config file (TOML)
     #[arg(long, default_value = "config.toml")]
     config: String,
-
-    /// Remote server address
     #[arg(long)]
     endpoint: Option<String>,
-    /// User id
     #[arg(long)]
     user: Option<String>,
-
-    /// Local server address
     #[arg(long)]
     host: Option<String>,
-    /// Local server port
     #[arg(long)]
     port: Option<u16>,
-    /// Local SOCKS5 server address (defaults to host)
     #[arg(long)]
     socks_host: Option<String>,
-    /// Local SOCKS5 server port (SOCKS5 disabled when unset)
     #[arg(long)]
     socks_port: Option<u16>,
+    /// SHA-256 cert hash (hex) for self-signed server certificates.
+    #[arg(long)]
+    cert_hash: Option<String>,
 }
 
 fn load_file_config(path: &str) -> ClientSection {
@@ -79,7 +65,8 @@ fn load_file_config(path: &str) -> ClientSection {
         .unwrap_or_default()
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
     let file = load_file_config(&cli.config);
 
@@ -109,7 +96,10 @@ fn main() {
         .unwrap_or_else(|| host.clone());
     let socks_port = cli.socks_port.or(file.socks_port);
 
-    // Build routing config.
+    let cert_hash_str = cli.cert_hash.or(file.cert_hash);
+
+    let trust = build_trust_config(cert_hash_str);
+
     let routing = build_routing(
         file.proxy.unwrap_or_default(),
         file.bypass.unwrap_or_default(),
@@ -119,22 +109,54 @@ fn main() {
         file.bypass_geoip_tags,
     );
 
-    let addr = format!("{}:{}", host, port);
-    task::block_on(async {
-        let http_listener = TcpListener::bind(&addr).await.unwrap();
-
-        let socks_listener = if let Some(sp) = socks_port {
-            let socks_addr = format!("{}:{}", socks_host, sp);
-            Some(TcpListener::bind(&socks_addr).await.unwrap())
-        } else {
-            None
-        };
-
-        let (_tx, rx) = make_shutdown_channel();
-        run_proxy_resilient(endpoint, user, http_listener, socks_listener, rx, routing)
-            .await
-            .unwrap();
+    let addr = format!("{host}:{port}");
+    let http_listener = TcpListener::bind(&addr).await.unwrap_or_else(|e| {
+        tracing::error!("failed to bind {addr}: {e}");
+        std::process::exit(1);
     });
+
+    let socks_listener = if let Some(sp) = socks_port {
+        let socks_addr = format!("{socks_host}:{sp}");
+        Some(TcpListener::bind(&socks_addr).await.unwrap_or_else(|e| {
+            tracing::error!("failed to bind socks5 {socks_addr}: {e}");
+            std::process::exit(1);
+        }))
+    } else {
+        None
+    };
+
+    let (_tx, rx) = make_shutdown_channel();
+    run_proxy_resilient(endpoint, user, trust, http_listener, socks_listener, rx, routing)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("proxy error: {e}");
+            std::process::exit(1);
+        });
+}
+
+fn build_trust_config(cert_hash_str: Option<String>) -> TlsTrustConfig {
+    if let Some(hash_hex) = cert_hash_str {
+        use wtransport::tls::{Sha256Digest, Sha256DigestFmt};
+        let hash = Sha256Digest::from_str_fmt(&hash_hex, Sha256DigestFmt::DottedHex)
+            .unwrap_or_else(|_| {
+                // Try parsing as raw hex (no dots) by inserting colons
+                let dotted = hash_hex
+                    .chars()
+                    .collect::<Vec<_>>()
+                    .chunks(2)
+                    .map(|c| c.iter().collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(":");
+                Sha256Digest::from_str_fmt(&dotted, Sha256DigestFmt::DottedHex)
+                    .unwrap_or_else(|e| {
+                        tracing::error!("invalid cert_hash: {e}");
+                        std::process::exit(1);
+                    })
+            });
+        TlsTrustConfig::CertHash(hash)
+    } else {
+        TlsTrustConfig::NativeCerts
+    }
 }
 
 fn build_routing(
@@ -147,14 +169,8 @@ fn build_routing(
 ) -> RoutingConfig {
     use client::HostPattern;
 
-    let proxy = proxy_patterns
-        .iter()
-        .map(|s| HostPattern::parse(s))
-        .collect();
-    let bypass = bypass_patterns
-        .iter()
-        .map(|s| HostPattern::parse(s))
-        .collect();
+    let proxy = proxy_patterns.iter().map(|s| HostPattern::parse(s)).collect();
+    let bypass = bypass_patterns.iter().map(|s| HostPattern::parse(s)).collect();
 
     let bypass_geosite = match dat_path_or_default(geosite_dat, DEFAULT_GEOSITE_DAT) {
         None => {
@@ -169,8 +185,6 @@ fn build_routing(
                     tracing::info!(
                         domains = matcher.domains.len(),
                         fulls = matcher.fulls.len(),
-                        keywords = matcher.keywords.len(),
-                        regexes = matcher.regexes.len(),
                         file = dat_path,
                         "loaded GeoSite rules"
                     );
@@ -194,7 +208,8 @@ fn build_routing(
             vec![]
         }
         Some((dat_path, required)) => {
-            let tags = geoip_tags.unwrap_or_else(|| vec!["cn".to_string(), "private".to_string()]);
+            let tags =
+                geoip_tags.unwrap_or_else(|| vec!["cn".to_string(), "private".to_string()]);
             match load_geoip_dat(Path::new(&dat_path), &tags) {
                 Ok(cidrs) => {
                     tracing::info!(count = cidrs.len(), file = dat_path, "loaded GeoIP CIDRs");
@@ -220,10 +235,18 @@ fn build_routing(
     }
 }
 
-fn dat_path_or_default(configured: Option<String>, default_path: &str) -> Option<(String, bool)> {
+fn dat_path_or_default(
+    configured: Option<String>,
+    default_name: &str,
+) -> Option<(String, bool)> {
     match configured {
-        Some(path) => Some((path, true)),
-        None if Path::new(default_path).is_file() => Some((default_path.to_string(), false)),
-        None => None,
+        Some(p) => Some((p, true)),
+        None => {
+            if Path::new(default_name).exists() {
+                Some((default_name.to_string(), false))
+            } else {
+                None
+            }
+        }
     }
 }

@@ -10,9 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 server = { path = "../server" }
 client = { path = "../client" }
-core-lib.workspace = true
-async-std = { workspace = true, features = ["attributes"] }
-async-tungstenite = { workspace = true, features = ["async-std-runtime"] }
+tokio = { workspace = true }
+wtransport.workspace = true
 futures.workspace = true
-uuid.workspace = true
 ipnet.workspace = true
