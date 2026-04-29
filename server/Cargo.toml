@@ -20,3 +20,6 @@ toml.workspace = true
 semver.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+client = { path = "../client" }
