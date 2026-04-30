@@ -159,6 +159,48 @@ client --QUIC/TLS/WebTransport--> Envoy UDP proxy --UDP--> Rust wtransport serve
 - 需要迁移当前 `wtransport` 的 session、stream、认证和重连语义。
 - 需要补齐大量集成测试，避免协议兼容性回归。
 
+#### `quinn` + `h3` 同端口 POC 可行性
+
+该路线比自研 Envoy / Nginx 插件更贴近当前需求。目标不是做一个通用边缘代理，而是在 Rust 服务内直接拥有 HTTP/3 和 WebTransport 能力：
+
+```text
+client --HTTP/3 / WebTransport--> Rust service:443 UDP
+                                  ├── GET /health → HTTP/3 response
+                                  └── CONNECT /wt → WebTransport session
+```
+
+协议分工大致为：
+
+- `quinn` 负责 QUIC endpoint、TLS、连接、stream、flow control。
+- `h3` 负责 HTTP/3 server、请求解析、响应发送。
+- `h3-webtransport` 负责 WebTransport over HTTP/3 session。
+
+这个模型与目标架构匹配：同一个 UDP 端口、同一套 QUIC/TLS 入口，在 HTTP/3 层按请求区分普通 endpoint 和 WebTransport session。
+
+当前项目迁移成本相对可控，因为现有代理数据面主要使用 WebTransport bidirectional stream，没有依赖 datagram。现有认证、目标地址校验、TCP relay 逻辑可以尽量保留，主要替换入口层：
+
+- `wtransport::Endpoint` 替换为 `quinn::Endpoint` + `h3::server::Connection`。
+- `IncomingSession` 替换为 HTTP/3 request router + `h3_webtransport` session accept。
+- `wtransport::SendStream` / `wtransport::RecvStream` 替换为 `quinn` / `h3` 侧 stream 类型或适配层。
+- `wtransport::Identity` 替换为 `rustls` + `quinn` server config。
+
+POC 成功标准：
+
+1. `curl --http3-only https://host:4433/health` 返回 200。
+2. 当前 `wtransport` client 连接 `https://host:4433/wt` 成功。
+3. 服务端 HTTP/3 SETTINGS 包含 `EnableWebTransport`、`WebTransportMaxSessions`、`EnableConnectProtocol`，并满足 `wtransport` 客户端校验。
+4. 第一个 bidirectional stream 完成 `Hello:<version>:<user>` / `Hi` 认证流程。
+5. 后续多个 bidirectional stream 可以复用同一个 WebTransport session 代理 TCP。
+
+主要风险：
+
+- `h3` / `h3-webtransport` API 成熟度和版本稳定性需要实测确认。
+- 必须验证与当前 `wtransport` 客户端的 wire compatibility，不能只用 `h3` 自己的 client 验证。
+- idle timeout、keepalive、最大 session 数、最大 stream 数需要重新配置，避免迁移后过载防御退化。
+- 自签证书场景仍需满足当前 `cert-hash` pinning 约束。
+
+判断：该方案可行性中高，工程成本明显低于维护 Envoy / Nginx fork，适合作为中期主线 POC。
+
 ### 3. 继续使用 `wtransport`，先做防护加固
 
 这是短期风险最低的方案。
