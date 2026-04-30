@@ -1,0 +1,3 @@
+# Minimal client config for Caddy/WebTransport POC: no SOCKS, no GeoIP/GeoSite paths.
+[client]
+log_level = "info"

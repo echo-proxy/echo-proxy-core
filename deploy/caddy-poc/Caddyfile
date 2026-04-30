@@ -1,0 +1,21 @@
+# Local POC: HTTP/3 edge on :8443, WebTransport path (/) proxied to Rust wtransport on :4433.
+# Run from this directory (or use ./run-caddy.sh): paths are relative to deploy/caddy-poc/.
+{
+	debug
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+:8443 {
+	tls ../certs/server.crt ../certs/server.key
+
+	respond /health 200
+
+	reverse_proxy https://127.0.0.1:4433 {
+		transport http {
+			versions 3
+			tls_insecure_skip_verify
+		}
+	}
+}

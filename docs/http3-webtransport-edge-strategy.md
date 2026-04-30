@@ -91,6 +91,28 @@ client --QUIC/TLS/WebTransport--> Envoy UDP proxy --UDP--> Rust wtransport serve
 
 如果未来要重新评估 Envoy 终止模式，需要确认 Envoy 是否已经能在 downstream HTTP/3 SETTINGS 中声明 `EnableWebTransport` 和 `WebTransportMaxSessions`，并且能把 WebTransport session 正确转发到 upstream。
 
+## Caddy 实测记录
+
+结论：与 Envoy 终止模式相同，**当前不能把官方 Caddy 当作 `wtransport` 的 WebTransport 终止反向代理使用**（特指 Caddy 终止 QUIC/TLS/HTTP3，再经 `reverse_proxy` 把会话转到后端 `wtransport`）。普通 HTTP/3 作为边缘入口可用，但不等同于对客户端声明完整 WebTransport 能力。
+
+验证环境：
+
+- Caddy `2.11.2`（本机 Homebrew；当时 `docker pull caddy` 因 registry TLS 超时未用镜像，验证方式与「官方发行版二进制」一致）。
+- Rust `wtransport` server 监听 `127.0.0.1:4433`（`deploy/certs` 自签证书）。
+- POC 配置目录：[deploy/caddy-poc/](../deploy/caddy-poc/)（`Caddyfile`、`run-caddy.sh`、`client-test.toml`）。
+
+已验证组合：
+
+- Caddy 在 `8443` 上 `respond /health 200`，客户端使用 `curl --http3-only` 访问得到 **HTTP/3**（`http_version` 为 `3`）。
+- 同一 Caddy 入口对 `/` 配置 `reverse_proxy https://127.0.0.1:4433`，且 `transport http { versions 3 tls_insecure_skip_verify }`：`wtransport` 客户端 **无法** 建立会话。
+
+现象（与 Envoy 根因一致）：
+
+- 客户端 debug 日志中，Caddy 返回的 HTTP/3 SETTINGS 仅包含类似 `EnableConnectProtocol`、`MaxFieldSectionSize`，**没有** `EnableWebTransport`、`WebTransportMaxSessions`。
+- `wtransport` 报错：`connect failed: server rejected WebTransport session request`。
+
+因此，`EnableConnectProtocol` 同样不能替代完整的 WebTransport 入口 SETTINGS；社区 issue 中维护者亦称反向代理需 **WebTransport-aware** 才能承载会话内 stream，与本次结果一致。
+
 ## 可选路线
 
 ### 1. 继续寻找合适边缘层
@@ -158,7 +180,7 @@ client --QUIC/TLS/WebTransport--> Envoy UDP proxy --UDP--> Rust wtransport serve
 推荐推进顺序：
 
 1. 保留当前 `wtransport` 实现，优先补应用层过载防御和认证前置。
-2. 继续调研可用边缘层，但不依赖 Envoy 当前 WebTransport 反代能力。
+2. 继续调研可用边缘层，但不依赖 Envoy / 官方 Caddy 当前 WebTransport **终止**反代能力。
 3. 新建最小 POC，验证 `quinn` + `h3` / WebTransport 生态能否在同一 UDP 端口同时处理：
    - `GET /health`
    - `CONNECT /wt`
@@ -204,7 +226,7 @@ Rust H3/WebTransport service:443 UDP
 
 问题不在于“是否应该隐藏 WebTransport 服务”，这个方向是对的。关键在于实现方式：
 
-- Envoy 当前表现不满足 `wtransport` 客户端对 WebTransport SETTINGS 的要求。
+- Envoy、官方 Caddy（本仓库 POC 版本）在 **终止 + HTTP/3 反代** 模式下均不满足 `wtransport` 客户端对 WebTransport SETTINGS 的要求。
 - `quiche` 能提供底层能力，但会显著增加协议实现和维护成本。
 - 更稳妥的中期方向是验证 `quinn` + `h3` / WebTransport 生态。
 - 在任何替换方案落地前，当前 `wtransport` 服务需要先补齐限流、认证前置和观测能力。
