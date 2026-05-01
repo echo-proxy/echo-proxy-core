@@ -2,7 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use h3::ext::Protocol;
 use h3::quic::BidiStream as H3QuicBidi;
 use h3::server::RequestStream;
@@ -125,9 +125,22 @@ pub async fn run_h3_on_quic_connection(conn: quinn::Connection, users: Arc<Vec<S
     }
 }
 
+/// Read and discard the entire request body so the QUIC receive side reaches a clean EOF.
+/// Without this, dropping `RequestStream` after `finish()` can reset the stream and confuse
+/// clients such as curl (`HTTP/3 stream reset by server`).
+async fn drain_request_body(stream: &mut H3RequestStreamBytes) -> Result<(), h3::error::StreamError> {
+    while let Some(mut chunk) = stream.recv_data().await? {
+        let n = chunk.remaining();
+        chunk.advance(n);
+    }
+    Ok(())
+}
+
 async fn send_health_ok(
     stream: &mut H3RequestStreamBytes,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    drain_request_body(stream).await?;
+
     let resp = Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -146,6 +159,9 @@ async fn send_health_ok(
 }
 
 async fn respond_status_text(stream: &mut H3RequestStreamBytes, status: StatusCode, msg: &[u8]) {
+    if drain_request_body(stream).await.is_err() {
+        return;
+    }
     if let Ok(resp) = Response::builder().status(status).body(()) {
         if stream.send_response(resp).await.is_err() {
             return;
