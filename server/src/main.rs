@@ -93,11 +93,15 @@ async fn main() {
         id
     } else {
         let cert_path = cli.cert.or(file.cert).unwrap_or_else(|| {
-            tracing::error!("--cert is required (or set [server] cert in config.toml), or use --self-signed");
+            tracing::error!(
+                "--cert is required (or set [server] cert in config.toml), or use --self-signed"
+            );
             std::process::exit(1);
         });
         let key_path = cli.key.or(file.key).unwrap_or_else(|| {
-            tracing::error!("--key is required (or set [server] key in config.toml), or use --self-signed");
+            tracing::error!(
+                "--key is required (or set [server] key in config.toml), or use --self-signed"
+            );
             std::process::exit(1);
         });
         Identity::load_pemfiles(&cert_path, &key_path)

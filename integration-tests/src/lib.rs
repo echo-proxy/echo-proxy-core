@@ -94,14 +94,11 @@ pub async fn spawn_raw_echo_upstream() -> SocketAddr {
 
 /// Start a proxy server with a fresh self-signed cert.
 /// Returns `(addr, cert_identity, shutdown_tx)`.
-pub async fn spawn_proxy_server(
-    users: Vec<String>,
-) -> (SocketAddr, broadcast::Sender<()>) {
-    let identity =
-        Identity::self_signed(["localhost", "127.0.0.1"]).expect("self-signed identity");
+pub async fn spawn_proxy_server(users: Vec<String>) -> (SocketAddr, broadcast::Sender<()>) {
+    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).expect("self-signed identity");
     let opts = server::ServerOptions { users, identity };
-    let se = server::ServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), opts)
-        .expect("bind server");
+    let se =
+        server::ServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), opts).expect("bind server");
     let addr = se.local_addr();
     let (tx, rx) = broadcast::channel::<()>(1);
     task::spawn(async move {
@@ -114,7 +111,7 @@ pub async fn spawn_proxy_server(
 
 /// Endpoint URL for a WebTransport test server.
 pub fn endpoint_url(addr: SocketAddr) -> String {
-    format!("https://127.0.0.1:{}/", addr.port())
+    format!("https://127.0.0.1:{}/wt", addr.port())
 }
 
 /// Start a proxy client (non-resilient, single token) connected to `server_addr`.
@@ -141,7 +138,13 @@ pub async fn spawn_resilient_proxy_client(
     user: &str,
 ) -> (SocketAddr, broadcast::Sender<()>) {
     let endpoint = endpoint_url(server_addr);
-    spawn_resilient_proxy_client_inner(endpoint, user.to_string(), client::RoutingConfig::default(), None).await
+    spawn_resilient_proxy_client_inner(
+        endpoint,
+        user.to_string(),
+        client::RoutingConfig::default(),
+        None,
+    )
+    .await
 }
 
 /// Like [`spawn_resilient_proxy_client`] but also starts a SOCKS5 listener.
@@ -162,7 +165,13 @@ pub async fn spawn_proxy_client_with_socks(
     let (tx, rx) = broadcast::channel::<()>(1);
     task::spawn(async move {
         client::run_proxy_resilient(
-            endpoint, user, trust, http_listener, Some(socks_listener), rx, routing,
+            endpoint,
+            user,
+            trust,
+            http_listener,
+            Some(socks_listener),
+            rx,
+            routing,
         )
         .await
         .ok();

@@ -1,4 +1,6 @@
-use integration_tests::{connect_via_proxy, spawn_proxy_client, spawn_proxy_server, spawn_raw_echo_upstream};
+use integration_tests::{
+    connect_via_proxy, spawn_proxy_client, spawn_proxy_server, spawn_raw_echo_upstream,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]

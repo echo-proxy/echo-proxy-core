@@ -1,11 +1,18 @@
-use integration_tests::{endpoint_url, insecure_client_config, spawn_proxy_client, spawn_proxy_server};
+use integration_tests::{
+    endpoint_url, insecure_client_config, spawn_proxy_client, spawn_proxy_server,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// An unknown user must fail the auth handshake.
 #[tokio::test]
 async fn unauthorized_user_rejected() {
     let (server_addr, _shutdown) = spawn_proxy_server(vec!["allowed".into()]).await;
     let endpoint = endpoint_url(server_addr);
-    let result = client::connect_and_auth(&endpoint, "ghost", insecure_client_config().build_client_config()).await;
+    let result = client::connect_and_auth(
+        &endpoint,
+        "ghost",
+        insecure_client_config().build_client_config(),
+    )
+    .await;
     assert!(result.is_none(), "expected None for unknown user");
 }
 
@@ -18,11 +25,7 @@ async fn invalid_version_rejected() {
     assert!(result.is_none(), "expected None for invalid version");
 }
 
-async fn connect_and_auth_test_version(
-    endpoint: &str,
-    user: &str,
-    version: &str,
-) -> Option<()> {
+async fn connect_and_auth_test_version(endpoint: &str, user: &str, version: &str) -> Option<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wtransport::Endpoint;
     let config = insecure_client_config().build_client_config();
@@ -36,7 +39,11 @@ async fn connect_and_auth_test_version(
     let mut buf = vec![0u8; 256];
     let n = ctrl.1.read(&mut buf).await.ok()??;
     let resp = std::str::from_utf8(&buf[..n]).ok()?;
-    if resp.starts_with("Hi") { Some(()) } else { None }
+    if resp.starts_with("Hi") {
+        Some(())
+    } else {
+        None
+    }
 }
 
 /// Requesting a private IP destination must result in HTTP 502.

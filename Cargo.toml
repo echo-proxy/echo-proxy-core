@@ -13,6 +13,15 @@ core-lib = { path = "core-lib" }
 wtransport = { version = "0.7", features = ["dangerous-configuration"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+bytes = "1"
+http = "1"
+quinn = "0.11"
+h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+h3-quinn = { version = "0.0.10", features = ["datagram"] }
+h3-webtransport = "0.1.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-util = { version = "0.7", features = ["io"] }
+pin-project-lite = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

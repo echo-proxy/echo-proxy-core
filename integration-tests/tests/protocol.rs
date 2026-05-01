@@ -5,7 +5,12 @@ use integration_tests::{endpoint_url, insecure_client_config, spawn_proxy_server
 async fn auth_hello_hi_flow() {
     let (server_addr, _shutdown) = spawn_proxy_server(vec!["testuser".into()]).await;
     let endpoint = endpoint_url(server_addr);
-    let conn = client::connect_and_auth(&endpoint, "testuser", insecure_client_config().build_client_config()).await;
+    let conn = client::connect_and_auth(
+        &endpoint,
+        "testuser",
+        insecure_client_config().build_client_config(),
+    )
+    .await;
     assert!(conn.is_some(), "expected successful auth");
 }
 
@@ -14,8 +19,12 @@ async fn auth_hello_hi_flow() {
 async fn auth_unknown_user_returns_bye() {
     let (server_addr, _shutdown) = spawn_proxy_server(vec!["allowed".into()]).await;
     let endpoint = endpoint_url(server_addr);
-    let conn =
-        client::connect_and_auth(&endpoint, "stranger", insecure_client_config().build_client_config()).await;
+    let conn = client::connect_and_auth(
+        &endpoint,
+        "stranger",
+        insecure_client_config().build_client_config(),
+    )
+    .await;
     assert!(conn.is_none(), "expected auth failure for unknown user");
 }
 

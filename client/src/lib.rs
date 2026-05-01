@@ -205,7 +205,11 @@ pub async fn run_proxy_resilient(
             loop {
                 match sl.accept().await {
                     Ok((stream, _)) => {
-                        task::spawn(handle_socks_connection(stream, shared.clone(), routing.clone()));
+                        task::spawn(handle_socks_connection(
+                            stream,
+                            shared.clone(),
+                            routing.clone(),
+                        ));
                     }
                     Err(_) => break,
                 }
@@ -357,11 +361,7 @@ async fn open_proxy_stream(
 
 // ── HTTP connection handler ───────────────────────────────────────────────────
 
-async fn handle_http_connection(
-    tcp: TcpStream,
-    shared: SharedConn,
-    routing: Arc<RoutingConfig>,
-) {
+async fn handle_http_connection(tcp: TcpStream, shared: SharedConn, routing: Arc<RoutingConfig>) {
     let (tcp, host, headers, body) = match parse_http_request(tcp).await {
         Some(r) => r,
         None => return,
@@ -464,7 +464,9 @@ async fn handle_socks_connection(
     let conn = match conn {
         Some(c) => c,
         None => {
-            let _ = tcp.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
+            let _ = tcp
+                .write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE))
+                .await;
             return;
         }
     };
@@ -478,7 +480,9 @@ async fn handle_socks_connection(
     let (wt_send, wt_recv) = match result {
         Ok(Some(s)) => s,
         _ => {
-            let _ = tcp.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
+            let _ = tcp
+                .write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE))
+                .await;
             return;
         }
     };
@@ -613,7 +617,9 @@ async fn handle_socks_direct(mut tcp: TcpStream, host: &str) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(host, "socks5 direct connect failed: {e}");
-            let _ = tcp.write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE)).await;
+            let _ = tcp
+                .write_all(&socks5_reply(SOCKS5_REP_GENERAL_FAILURE))
+                .await;
             return;
         }
     };
@@ -679,7 +685,18 @@ async fn parse_http_request(tcp: TcpStream) -> Option<(TcpStream, String, String
 // ── SOCKS5 helpers ────────────────────────────────────────────────────────────
 
 fn socks5_reply(rep: u8) -> [u8; 10] {
-    [SOCKS5_VERSION, rep, 0x00, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0, 0]
+    [
+        SOCKS5_VERSION,
+        rep,
+        0x00,
+        SOCKS5_ATYP_IPV4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
 }
 
 async fn parse_socks5_request(stream: &mut TcpStream) -> Option<String> {
@@ -713,7 +730,9 @@ async fn parse_socks5_request(stream: &mut TcpStream) -> Option<String> {
     let atyp = req[3];
 
     if cmd != SOCKS5_CMD_CONNECT {
-        let _ = stream.write_all(&socks5_reply(SOCKS5_REP_CMD_NOT_SUPPORTED)).await;
+        let _ = stream
+            .write_all(&socks5_reply(SOCKS5_REP_CMD_NOT_SUPPORTED))
+            .await;
         return None;
     }
 

@@ -1,6 +1,4 @@
-use integration_tests::{
-    http_get_via_proxy, insecure_client_config, spawn_http_upstream,
-};
+use integration_tests::{http_get_via_proxy, insecure_client_config, spawn_http_upstream};
 use std::time::Duration;
 
 /// When no proxy server is reachable, the resilient client must return 502 quickly.
@@ -17,7 +15,7 @@ async fn returns_502_when_no_server_available() {
     // Give OS time to release the port
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let dead_endpoint = format!("https://127.0.0.1:{dead_port}/");
+    let dead_endpoint = format!("https://127.0.0.1:{dead_port}/wt");
 
     let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = http_listener.local_addr().unwrap();
@@ -67,8 +65,8 @@ async fn recovers_after_server_restart() {
         users: vec!["testuser".into()],
         identity,
     };
-    let se = server::ServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), opts)
-        .expect("bind server");
+    let se =
+        server::ServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), opts).expect("bind server");
     let server_addr = se.local_addr();
     let (stop1_tx, stop1_rx) = tokio::sync::broadcast::channel::<()>(1);
     let server_port = server_addr.port();
@@ -78,7 +76,7 @@ async fn recovers_after_server_restart() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let endpoint = format!("https://127.0.0.1:{server_port}/");
+    let endpoint = format!("https://127.0.0.1:{server_port}/wt");
     let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = http_listener.local_addr().unwrap();
     let (_tx2, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);

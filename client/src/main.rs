@@ -1,8 +1,8 @@
+use clap::Parser;
 use client::{
     RoutingConfig, TlsTrustConfig, geoip::load_geoip_dat, geosite::load_geosite_dat,
     make_shutdown_channel, run_proxy_resilient,
 };
-use clap::Parser;
 use serde::Deserialize;
 use std::path::Path;
 use tokio::net::TcpListener;
@@ -72,7 +72,10 @@ async fn main() {
     let cli = Cli::parse();
     let file = load_file_config(&cli.config);
 
-    let log_level = cli.log_level.or(file.log_level).unwrap_or_else(|| "info".to_string());
+    let log_level = cli
+        .log_level
+        .or(file.log_level)
+        .unwrap_or_else(|| "info".to_string());
     fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .with_target(false)
@@ -128,12 +131,20 @@ async fn main() {
     };
 
     let (_tx, rx) = make_shutdown_channel();
-    run_proxy_resilient(endpoint, user, trust, http_listener, socks_listener, rx, routing)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("proxy error: {e}");
-            std::process::exit(1);
-        });
+    run_proxy_resilient(
+        endpoint,
+        user,
+        trust,
+        http_listener,
+        socks_listener,
+        rx,
+        routing,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!("proxy error: {e}");
+        std::process::exit(1);
+    });
 }
 
 fn build_trust_config(cert_hash_str: Option<String>) -> TlsTrustConfig {
@@ -149,11 +160,12 @@ fn build_trust_config(cert_hash_str: Option<String>) -> TlsTrustConfig {
                     .map(|c| c.iter().collect::<String>())
                     .collect::<Vec<_>>()
                     .join(":");
-                Sha256Digest::from_str_fmt(&dotted, Sha256DigestFmt::DottedHex)
-                    .unwrap_or_else(|e| {
+                Sha256Digest::from_str_fmt(&dotted, Sha256DigestFmt::DottedHex).unwrap_or_else(
+                    |e| {
                         tracing::error!("invalid cert_hash: {e}");
                         std::process::exit(1);
-                    })
+                    },
+                )
             });
         TlsTrustConfig::CertHash(hash)
     } else {
@@ -171,8 +183,14 @@ fn build_routing(
 ) -> RoutingConfig {
     use client::HostPattern;
 
-    let proxy = proxy_patterns.iter().map(|s| HostPattern::parse(s)).collect();
-    let bypass = bypass_patterns.iter().map(|s| HostPattern::parse(s)).collect();
+    let proxy = proxy_patterns
+        .iter()
+        .map(|s| HostPattern::parse(s))
+        .collect();
+    let bypass = bypass_patterns
+        .iter()
+        .map(|s| HostPattern::parse(s))
+        .collect();
 
     let bypass_geosite = match dat_path_or_default(geosite_dat, DEFAULT_GEOSITE_DAT) {
         None => {
@@ -210,8 +228,7 @@ fn build_routing(
             vec![]
         }
         Some((dat_path, required)) => {
-            let tags =
-                geoip_tags.unwrap_or_else(|| vec!["cn".to_string(), "private".to_string()]);
+            let tags = geoip_tags.unwrap_or_else(|| vec!["cn".to_string(), "private".to_string()]);
             match load_geoip_dat(Path::new(&dat_path), &tags) {
                 Ok(cidrs) => {
                     tracing::info!(count = cidrs.len(), file = dat_path, "loaded GeoIP CIDRs");
@@ -237,10 +254,7 @@ fn build_routing(
     }
 }
 
-fn dat_path_or_default(
-    configured: Option<String>,
-    default_name: &str,
-) -> Option<(String, bool)> {
+fn dat_path_or_default(configured: Option<String>, default_name: &str) -> Option<(String, bool)> {
     match configured {
         Some(p) => Some((p, true)),
         None => {

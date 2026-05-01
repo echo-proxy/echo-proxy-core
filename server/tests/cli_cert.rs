@@ -93,7 +93,7 @@ async fn server_binary_starts_with_pem_certificate() {
             .expect("spawn server binary"),
     );
 
-    let endpoint = format!("https://127.0.0.1:{port}/");
+    let endpoint = format!("https://127.0.0.1:{port}/wt");
     let trust = client::TlsTrustConfig::CertHash(cert_hash);
     let connected = wait_for_auth(&endpoint, trust, &mut server).await;
     assert!(connected, "server did not accept auth with PEM certificate");

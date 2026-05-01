@@ -48,14 +48,16 @@ async fn setup() -> (
 ) {
     let upstream_addr = spawn_http_upstream().await;
     let (server_addr, server_shutdown) = spawn_proxy_server(vec!["testuser".into()]).await;
-    let ((http_addr, socks_addr), client_shutdown) = spawn_proxy_client_with_socks(
-        server_addr,
-        "testuser",
-        client::RoutingConfig::default(),
-    )
-    .await;
+    let ((http_addr, socks_addr), client_shutdown) =
+        spawn_proxy_client_with_socks(server_addr, "testuser", client::RoutingConfig::default())
+            .await;
     let host = format!("localhost:{}", upstream_addr.port());
-    (host, http_addr, socks_addr, vec![server_shutdown, client_shutdown])
+    (
+        host,
+        http_addr,
+        socks_addr,
+        vec![server_shutdown, client_shutdown],
+    )
 }
 
 /// SOCKS5 CONNECT via tunnel must successfully forward to the upstream.
@@ -65,13 +67,17 @@ async fn socks5_connect_via_tunnel() {
 
     let mut stream = connect_via_socks5(socks_addr, &host).await;
 
-    let req = format!("GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", host);
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        host
+    );
     stream.write_all(req.as_bytes()).await.unwrap();
 
     let (status, body) = read_http_response(&mut stream).await;
     assert_eq!(status, 200, "expected 200, got {status}");
     assert!(
-        body.windows(b"hello-upstream".len()).any(|w| w == b"hello-upstream"),
+        body.windows(b"hello-upstream".len())
+            .any(|w| w == b"hello-upstream"),
         "expected 'hello-upstream' in response body"
     );
 }
@@ -97,13 +103,17 @@ async fn socks5_connect_direct_bypass() {
 
     let mut stream = connect_via_socks5(socks_addr, &host).await;
 
-    let req = format!("GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", host);
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        host
+    );
     stream.write_all(req.as_bytes()).await.unwrap();
 
     let (status, body) = read_http_response(&mut stream).await;
     assert_eq!(status, 200, "direct bypass: expected 200, got {status}");
     assert!(
-        body.windows(b"hello-upstream".len()).any(|w| w == b"hello-upstream"),
+        body.windows(b"hello-upstream".len())
+            .any(|w| w == b"hello-upstream"),
         "direct bypass body missing 'hello-upstream'"
     );
 }
@@ -116,18 +126,24 @@ async fn http_and_socks5_share_tunnel() {
     let (status, body) = http_get_via_proxy(http_addr, &host, "/").await;
     assert_eq!(status, 200, "http proxy: expected 200");
     assert!(
-        body.windows(b"hello-upstream".len()).any(|w| w == b"hello-upstream"),
+        body.windows(b"hello-upstream".len())
+            .any(|w| w == b"hello-upstream"),
         "http proxy body missing 'hello-upstream'"
     );
 
     let mut socks_stream = connect_via_socks5(socks_addr, &host).await;
-    let req = format!("GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", host);
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        host
+    );
     socks_stream.write_all(req.as_bytes()).await.unwrap();
 
     let (status2, body2) = read_http_response(&mut socks_stream).await;
     assert_eq!(status2, 200, "socks5: expected 200, got {status2}");
     assert!(
-        body2.windows(b"hello-upstream".len()).any(|w| w == b"hello-upstream"),
+        body2
+            .windows(b"hello-upstream".len())
+            .any(|w| w == b"hello-upstream"),
         "socks5 body missing 'hello-upstream'"
     );
 }
@@ -154,5 +170,9 @@ async fn socks5_unsupported_command_rejected() {
 
     let mut reply = [0u8; 10];
     stream.read_exact(&mut reply).await.unwrap();
-    assert_eq!(reply[1], 0x07, "expected CMD_NOT_SUPPORTED(0x07), got {}", reply[1]);
+    assert_eq!(
+        reply[1], 0x07,
+        "expected CMD_NOT_SUPPORTED(0x07), got {}",
+        reply[1]
+    );
 }
